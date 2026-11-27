@@ -355,6 +355,29 @@ class TestAgentProxy(unittest.TestCase):
             )
             self.assertIn("agent-proxy", help_res.stdout)
 
+    def test_start_daemon_detects_port_conflict(self) -> None:
+        async def run() -> None:
+            server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            saved = (mod.STATE_DIR, mod.PID_FILE, mod.STATE_FILE, mod.LOG_FILE)
+            with tempfile.TemporaryDirectory() as tmp:
+                state_dir = Path(tmp)
+                mod.STATE_DIR = state_dir
+                mod.PID_FILE = state_dir / "proxy.pid"
+                mod.STATE_FILE = state_dir / "state.json"
+                mod.LOG_FILE = state_dir / "proxy.log"
+                try:
+                    with self.assertRaises(RuntimeError) as ctx:
+                        mod.start_daemon(SAMPLE_VLESS_URI, "127.0.0.1", port, False, False)
+                    self.assertIn("already in use", str(ctx.exception))
+                    self.assertFalse((state_dir / "proxy.log").exists())
+                finally:
+                    mod.STATE_DIR, mod.PID_FILE, mod.STATE_FILE, mod.LOG_FILE = saved
+                    server.close()
+                    await server.wait_closed()
+
+        asyncio.run(run())
+
     def test_install_sh_refuses_to_clobber_local_changes(self) -> None:
         repo_root = Path(__file__).resolve().parent
         script = repo_root / "install.sh"

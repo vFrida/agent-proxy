@@ -934,6 +934,29 @@ def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
             time.sleep(0.05)
 
 
+def find_port_owner(port: int) -> Optional[int]:
+    """Best-effort PID of the process listening on a TCP port (None if unknown)."""
+    if not shutil.which("lsof"):
+        return None
+    try:
+        res = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.split():
+        try:
+            return int(line)
+        except ValueError:
+            continue
+    return None
+
+
 def start_daemon(uri: str, host: str, port: int, insecure: bool, verbose: bool) -> Dict[str, Any]:
     existing = read_running_state()
     if existing:
@@ -948,6 +971,13 @@ def start_daemon(uri: str, host: str, port: int, insecure: bool, verbose: bool) 
             return existing
         # Endpoint or upstream node changed; stop the previous daemon first.
         stop_daemon()
+    elif _wait_for_port(host, port, timeout=0.2):
+        owner = find_port_owner(port)
+        owner_info = f" (PID {owner})" if owner else ""
+        raise RuntimeError(
+            f"Port {port} on {host} is already in use by another process{owner_info}. "
+            f"Stop that process, or start on another port: agent-proxy start -d --port <port>."
+        )
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -975,27 +1005,34 @@ def start_daemon(uri: str, host: str, port: int, insecure: bool, verbose: bool) 
             start_new_session=True,
         )
 
-    if not _wait_for_port(host, port, timeout=5.0):
-        try:
-            proc.terminate()
-            proc.wait(timeout=2.0)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        tail = ""
-        if LOG_FILE.exists():
-            tail = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1000:].strip()
-        detail = f"\nLog tail:\n{tail}" if tail else ""
-        raise RuntimeError(
-            f"Proxy daemon failed to start on {host}:{port}. See {LOG_FILE} for details.{detail}"
-        )
+    deadline = time.monotonic() + 5.0
+    ready = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        if _wait_for_port(host, port, timeout=0.1):
+            ready = True
+            break
 
     state = read_running_state()
-    if state:
+    if ready and proc.poll() is None and state and _as_int(state.get("pid"), -1) == proc.pid:
         return state
-    return {"pid": proc.pid, "listen_host": host, "listen_port": port}
+
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    tail = ""
+    if LOG_FILE.exists():
+        tail = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1000:].strip()
+    detail = f"\nLog tail:\n{tail}" if tail else ""
+    raise RuntimeError(
+        f"Proxy daemon failed to start on {host}:{port}. See {LOG_FILE} for details.{detail}"
+    )
 
 
 def stop_daemon() -> bool:
@@ -1126,6 +1163,17 @@ def cmd_stop(_args: argparse.Namespace) -> int:
 def cmd_status(_args: argparse.Namespace) -> int:
     state = read_running_state()
     if not state:
+        external = _wait_for_port(DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT, timeout=0.2)
+        if external:
+            owner = find_port_owner(DEFAULT_LISTEN_PORT)
+            owner_info = f" (PID {owner})" if owner else ""
+            print(
+                f"{strong('Status')}: {warn('RUNNING (unmanaged)')} on "
+                f"{value(f'{DEFAULT_LISTEN_HOST}:{DEFAULT_LISTEN_PORT}')}{owner_info}"
+            )
+            print(note("Another process is listening on this port but is not managed by agent-proxy."))
+            print(note("Stop it (or use a different --port) before running: agent-proxy start -d"))
+            return 0
         print(f"{strong('Status')}: {fail('STOPPED')}")
         try:
             configured = resolve_upstream_uri(None)
