@@ -1,128 +1,130 @@
 # Agent Proxy (`agent-proxy`)
 
-零依赖（仅用 Python 3 标准库，无需额外代理客户端）：把上游加密节点转为本地 **HTTP / HTTPS / SOCKS5 混合代理**，并支持统一接管 **Antigravity (`agy`)、Claude Code (`claude`)、OpenAI Codex (`codex`)、Cursor (`cursor`)** 及任意其它 CLI 开发工具。
+English | [简体中文](README.zh-CN.md)
 
-默认本地监听 `127.0.0.1:17890`（同时支持 `http://` 和 `socks5h://`），本机与内网地址自动直连。
+Zero dependencies (Python 3 standard library only, no extra proxy client): turns an encrypted upstream node into a local **HTTP / HTTPS / SOCKS5 mixed proxy**, and uniformly wraps **Antigravity (`agy`), Claude Code (`claude`), OpenAI Codex (`codex`), Cursor (`cursor`)** plus any other CLI dev tool.
+
+It listens on `127.0.0.1:17890` by default (both `http://` and `socks5h://`); loopback and intranet addresses are connected directly.
 
 ---
 
-## 环境要求
+## Requirements
 
 - macOS / Linux
-- Python 3（实测 3.9+）
-- 不需要 root；只监听 `127.0.0.1`
+- Python 3 (tested on 3.9+)
+- No root required; only listens on `127.0.0.1`
 
-## 快速开始
+## Quick Start
 
-首次使用前需配置你自己的上游 VLESS 节点：直接执行 `wrap` 或 `start -d` 时若尚未配置，会自动提示输入并保存到 `~/.agent-proxy/config.json`（也可通过 `--uri` 或环境变量 `AGENT_PROXY_URI` 传入）。
+Configure your own upstream VLESS node first: running `wrap` or `start -d` without a saved config prompts for input and saves it to `~/.agent-proxy/config.json` (you can also pass `--uri` or the `AGENT_PROXY_URI` env var).
 
 ```bash
 cd ~/agent-proxy
 
-./agent-proxy list                  # 查看本机已检测到的工具与接管状态
-./agent-proxy wrap                  # 首次会提示输入节点 URI，然后一次性接管所有已检测到的工具
-./agent-proxy wrap agy claude codex # 或只接管指定工具
+./agent-proxy list                  # Show detected tools and their wrap status
+./agent-proxy wrap                  # Prompts for node URI on first use, then wraps every detected tool
+./agent-proxy wrap agy claude codex # Or wrap only the specified tools
 ```
 
-接管之后，直接执行 `agy`、`claude`、`codex`、`cursor` 时都会自动检测本地代理是否在线（未启动会自动拉起），并自动注入代理环境变量。
+Once wrapped, running `agy`, `claude`, `codex` or `cursor` automatically checks whether the local proxy is up (starting it if needed) and injects the proxy environment variables.
 
-不想改任何二进制，也可以用 `run` 按需套代理运行：
+To avoid touching any binary, use `run` to run a command through the proxy on demand:
 
 ```bash
-./agent-proxy run claude            # 临时通过代理运行 Claude Code
-./agent-proxy run codex             # 临时通过代理运行 Codex
-eval "$(./agent-proxy env)"         # 在当前终端会话临时导出代理环境变量
+./agent-proxy run claude            # Run Claude Code through the proxy temporarily
+./agent-proxy run codex             # Run Codex through the proxy temporarily
+eval "$(./agent-proxy env)"         # Export proxy env vars into the current shell session
 ```
 
-> **已经在跑的进程不会自动生效**：进程启动时环境已固定（如 IDE 常驻的 `agy --hub`）。确认可重启后执行 `./agent-proxy wrap --restart`，或在 IDE 里 `Developer: Reload Window` / 重开会话。
+> **Already-running processes are not affected**: their environment is fixed at launch (e.g. a long-lived IDE `agy --hub`). If it is safe to restart them, run `./agent-proxy wrap --restart`, or use `Developer: Reload Window` / reopen the session in your IDE.
 
 ---
 
-## 支持的工具
+## Supported Tools
 
-| 名称 | 覆盖范围 | 接管方式 |
+| Name | Coverage | How it is wrapped |
 | --- | --- | --- |
-| `agy`（别名 `antigravity`） | `PATH`、`~/.local/bin/agy`、`~/.gemini/bin/agy` | CLI 包装脚本（同时覆盖 IDE 插件链路） |
-| `claude`（别名 `claude-code`） | `PATH`、`~/.local/bin/claude`、`~/.claude/local/claude`、Homebrew / npm 路径 | CLI 包装（兼容软链） |
-| `codex`（别名 `openai-codex`） | `PATH`、`~/.local/bin/codex`、Homebrew / npm / cargo 路径 | CLI 包装（兼容软链） |
-| `cursor` | `cursor` CLI | CLI 包装（兼容软链） |
-| 任意其它 CLI | 任意路径 | `wrap --bin /path/to/cmd`、`run <cmd>` |
+| `agy` (alias `antigravity`) | `PATH`, `~/.local/bin/agy`, `~/.gemini/bin/agy` | CLI wrapper script (also covers IDE plugin paths) |
+| `claude` (alias `claude-code`) | `PATH`, `~/.local/bin/claude`, `~/.claude/local/claude`, Homebrew / npm paths | CLI wrapper (symlink-safe) |
+| `codex` (alias `openai-codex`) | `PATH`, `~/.local/bin/codex`, Homebrew / npm / cargo paths | CLI wrapper (symlink-safe) |
+| `cursor` | `cursor` CLI | CLI wrapper (symlink-safe) |
+| Any other CLI | Any path | `wrap --bin /path/to/cmd`, `run <cmd>` |
 
 ---
 
-## 命令一览
+## Commands
 
-| 命令 | 说明 |
+| Command | Description |
 | --- | --- |
-| `./agent-proxy list` | 列出支持的工具、检测到的安装路径及当前接管状态 |
-| `./agent-proxy wrap [agents...]` | 接管指定工具（不填则接管全部已检测到的工具） |
-| `./agent-proxy wrap --bin /path/to/cmd` | 额外包装其它自定义 CLI 路径（可重复） |
-| `./agent-proxy wrap --restart` | 结束后台已在跑的目标进程，使其重启后生效 |
-| `./agent-proxy unwrap [agents...]` | 还原包装脚本（不填则还原全部） |
-| `./agent-proxy run <cmd> [args...]` | 自动拉起代理并带代理环境执行任意命令 |
-| `./agent-proxy env [--intranet-no-proxy] [--unset]` | 输出当前 shell 可 `eval` 的 `export` / `unset` 语句 |
-| `./agent-proxy start -d` | 后台启动本地代理（默认 `127.0.0.1:17890`） |
-| `./agent-proxy start` | 前台启动本地代理（可加 `-v` 看连接日志） |
-| `./agent-proxy status` | 查看代理状态、PID、端口、上游节点、日志路径 |
-| `./agent-proxy stop` | 停止后台代理 |
+| `./agent-proxy list` | List supported tools, detected install paths, and current wrap status |
+| `./agent-proxy wrap [agents...]` | Wrap the given tools (all detected tools if omitted) |
+| `./agent-proxy wrap --bin /path/to/cmd` | Additionally wrap a custom CLI path (repeatable) |
+| `./agent-proxy wrap --restart` | Terminate running target processes so they pick up the new env |
+| `./agent-proxy unwrap [agents...]` | Restore wrapper scripts (all if omitted) |
+| `./agent-proxy run <cmd> [args...]` | Start the proxy and run any command with proxy env |
+| `./agent-proxy env [--intranet-no-proxy] [--unset]` | Print `export` / `unset` statements to `eval` in the current shell |
+| `./agent-proxy start -d` | Start the local proxy in the background (default `127.0.0.1:17890`) |
+| `./agent-proxy start` | Start the local proxy in the foreground (add `-v` for connection logs) |
+| `./agent-proxy status` | Show proxy status, PID, port, upstream node, and log path |
+| `./agent-proxy stop` | Stop the background proxy |
 
-`start` 常用参数：`--uri <uri>`（临时换节点）、`--save`（写入默认配置）、`--port`、`--insecure`（跳过上游证书校验）。
+Common `start` options: `--uri <uri>` (switch node temporarily), `--save` (persist as default), `--port`, `--insecure` (skip upstream certificate verification).
 
 ---
 
-## 更换节点
+## Changing the Node
 
-持久化配置位于 `~/.agent-proxy/config.json`（兼容读取旧版 `~/.antigravity-vless-proxy/config.json`）：
+Persistent config lives in `~/.agent-proxy/config.json` (the legacy `~/.antigravity-vless-proxy/config.json` is also read):
 
 ```json
 { "upstream_uri": "..." }
 ```
 
-或直接通过命令行切换并保存：
+Or switch and save from the command line:
 
 ```bash
 ./agent-proxy stop
 ./agent-proxy start -d --save --uri '<node-uri>'
 ```
 
-> 守护进程按「同 host:port 且已监听」复用已有进程，换节点前请先执行 `stop`。
+> The daemon reuses an existing process when the same host:port is already listening, so run `stop` before switching nodes.
 
 ---
 
-## 工作原理
+## How It Works
 
-1. **零依赖本地混合代理**：原生实现加密 TLS 隧道转发，本地同时提供 HTTP `CONNECT`（HTTPS / HTTP/2 / gRPC）、普通 HTTP 与 SOCKS5；`localhost / 127.0.0.1 / ::1 / *.local` 自动直连，不影响本地通信。
-2. **兼容软链的 CLI 包装**：`wrap` 将原入口（二进制或 npm/Homebrew 软链）原地改名为 `<name>.real` 并生成薄 shell 包装脚本：
-   1. 检测 `127.0.0.1:17890`，未启动时自动执行 `agent-proxy start -d` 拉起（最多等 5s）；
-   2. 注入 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` / `NODE_USE_ENV_PROXY=1`（同时兼容 Go、Node.js、Python、Rust 工具）；
-   3. `exec <name>.real "$@"`，参数、stdio、退出码原样透传。
-3. **仅面向 CLI**：工具只通过包装 CLI / 注入环境变量生效，不启动或修改任何桌面（GUI）应用；桌面应用需自行在设置中配置代理。
+1. **Zero-dependency local mixed proxy**: implements encrypted TLS tunnel forwarding natively and serves HTTP `CONNECT` (HTTPS / HTTP/2 / gRPC), plain HTTP and SOCKS5 locally; `localhost / 127.0.0.1 / ::1 / *.local` are connected directly so local traffic is unaffected.
+2. **Symlink-safe CLI wrapping**: `wrap` renames the original entry point (binary or npm/Homebrew symlink) in place to `<name>.real` and generates a thin shell wrapper that:
+   1. checks `127.0.0.1:17890` and runs `agent-proxy start -d` if it is not up (waits up to 5s);
+   2. injects `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` / `NODE_USE_ENV_PROXY=1` (works with Go, Node.js, Python and Rust tools);
+   3. `exec <name>.real "$@"`, passing through arguments, stdio and exit code unchanged.
+3. **CLI only**: the tool takes effect purely by wrapping CLIs / injecting env vars; it never launches or modifies any desktop (GUI) app. Configure the proxy in the desktop app's settings yourself.
 
 ---
 
-## 目录与文件
+## Files
 
-| 路径 | 说明 |
+| Path | Description |
 | --- | --- |
-| `agent-proxy` | CLI 启动器（`exec python3 agent_proxy.py "$@"`） |
-| `agent_proxy.py` | 本地代理与多工具接管实现 |
-| `test_agent_proxy.py` | 单元测试与本地回环集成测试 |
-| `~/.agent-proxy/config.json` | 默认上游节点配置 |
-| `~/.agent-proxy/wrapped.json` | 已包装路径记录（供 `unwrap` 完整还原） |
-| `~/.agent-proxy/proxy.pid` / `state.json` | 守护进程状态 |
-| `~/.agent-proxy/proxy.log` | 代理运行日志 |
+| `agent-proxy` | CLI launcher (`exec python3 agent_proxy.py "$@"`) |
+| `agent_proxy.py` | Local proxy and multi-tool wrapping implementation |
+| `test_agent_proxy.py` | Unit tests and loopback integration tests |
+| `~/.agent-proxy/config.json` | Default upstream node config |
+| `~/.agent-proxy/wrapped.json` | Registry of wrapped paths (used by `unwrap`) |
+| `~/.agent-proxy/proxy.pid` / `state.json` | Daemon state |
+| `~/.agent-proxy/proxy.log` | Proxy runtime log |
 
-自测：`python3 -m unittest test_agent_proxy -v`
+Self-test: `python3 -m unittest test_agent_proxy -v`
 
 ---
 
-## 常见问题
+## FAQ
 
-| 现象 | 处理 |
+| Symptom | Fix |
 | --- | --- |
-| CLI 运行正常但网络报错 / 超时 | 执行 `./agent-proxy list` 确认状态为 `WRAPPED`，`./agent-proxy status` 确认 `RUNNING` |
-| `Status: STOPPED` | `./agent-proxy start -d`；或直接调用已包装的 CLI 自动拉起 |
-| 工具自更新后不走代理了 | 重跑一次 `./agent-proxy wrap <tool>` 即可重新接管 |
-| 接管后当前会话仍未生效 | 旧进程环境已固定：`./agent-proxy wrap --restart` 或重启 IDE / Reload Window |
-| 端口被占用 | `lsof -nP -iTCP:17890`；或改用 `--port <新端口>` 启动并重新 `wrap --port <新端口>` |
-| 彻底卸载 | `./agent-proxy unwrap`（还原全部包装脚本） |
+| CLI runs but network errors / timeouts | Run `./agent-proxy list` to confirm `WRAPPED`, and `./agent-proxy status` to confirm `RUNNING` |
+| `Status: STOPPED` | `./agent-proxy start -d`; or just invoke a wrapped CLI to auto-start it |
+| Stops proxying after a tool self-update | Re-run `./agent-proxy wrap <tool>` to re-wrap it |
+| Not effective in the current session after wrapping | Old processes have a fixed env: `./agent-proxy wrap --restart` or restart the IDE / Reload Window |
+| Port already in use | `lsof -nP -iTCP:17890`; or start with `--port <new-port>` and re-run `wrap --port <new-port>` |
+| Full uninstall | `./agent-proxy unwrap` (restores all wrapper scripts) |
