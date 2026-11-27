@@ -79,7 +79,12 @@ sync_repo() {
     log "Updating existing repository in $install_dir (${ref})..."
     git -C "$install_dir" remote set-url origin "$repo_url" 2>/dev/null || \
       git -C "$install_dir" remote add origin "$repo_url"
-    git -C "$install_dir" fetch --depth 1 origin "$ref"
+    if [ -f "$install_dir/.git/shallow" ]; then
+      git -C "$install_dir" fetch --unshallow origin "$ref" 2>/dev/null || \
+        git -C "$install_dir" fetch origin "$ref"
+    else
+      git -C "$install_dir" fetch origin "$ref"
+    fi
     git -C "$install_dir" checkout -f -B "$ref" FETCH_HEAD
     return 0
   fi
@@ -87,7 +92,7 @@ sync_repo() {
   if [ ! -e "$install_dir" ] || is_dir_empty "$install_dir"; then
     [ -d "$install_dir" ] && rmdir "$install_dir" 2>/dev/null || true
     log "Cloning ${repo_url} (${ref}) into ${install_dir}..."
-    if git clone --depth 1 --branch "$ref" "$repo_url" "$install_dir" 2>/dev/null; then
+    if git clone --branch "$ref" "$repo_url" "$install_dir" 2>/dev/null; then
       return 0
     fi
     # Fallback for commit SHAs where `git clone --branch <sha>` is unsupported
@@ -95,7 +100,7 @@ sync_repo() {
     mkdir -p "$install_dir"
     git -C "$install_dir" init -q
     git -C "$install_dir" remote add origin "$repo_url"
-    git -C "$install_dir" fetch --depth 1 origin "$ref"
+    git -C "$install_dir" fetch origin "$ref"
     git -C "$install_dir" checkout -f FETCH_HEAD
     return 0
   fi
@@ -106,7 +111,7 @@ sync_repo() {
   git -C "$install_dir" init -q
   git -C "$install_dir" remote set-url origin "$repo_url" 2>/dev/null || \
     git -C "$install_dir" remote add origin "$repo_url"
-  git -C "$install_dir" fetch --depth 1 origin "$ref"
+  git -C "$install_dir" fetch origin "$ref"
   git -C "$install_dir" checkout -f -B "$ref" FETCH_HEAD
 }
 
@@ -178,7 +183,7 @@ main() {
 
   python3 -m py_compile "$install_dir/agent_proxy.py" || err "Syntax verification failed for agent_proxy.py"
 
-  log "Installed to: $install_dir"
+  log "Installed to: $install_dir ($("$install_dir/agent-proxy" version 2>/dev/null || echo 'version unknown'))"
 
   if [ "$no_path" -eq 0 ]; then
     local install_args=(install --shell "$shell_type" --dir "$install_dir")

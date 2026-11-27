@@ -336,6 +336,92 @@ class TestAgentProxy(unittest.TestCase):
             )
             self.assertIn("agent-proxy", help_res.stdout)
 
+    def test_version_and_update(self) -> None:
+        repo_root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            origin_repo = tmp_path / "origin"
+            origin_repo.mkdir()
+
+            def git(cwd: Path, *args: str) -> str:
+                res = subprocess.run(
+                    ["git", "-C", str(cwd), *args],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                return res.stdout.strip()
+
+            git(origin_repo, "init", "-q", "-b", "main")
+            git(origin_repo, "config", "user.name", "Test")
+            git(origin_repo, "config", "user.email", "test@example.com")
+            for fname in ("agent-proxy", "agent_proxy.py"):
+                dst = origin_repo / fname
+                dst.write_bytes((repo_root / fname).read_bytes())
+                os.chmod(dst, 0o755)
+            git(origin_repo, "add", "agent-proxy", "agent_proxy.py")
+            git(origin_repo, "commit", "-q", "-m", "commit 1")
+
+            client_dir = tmp_path / "client"
+            subprocess.run(
+                ["git", "clone", "-q", f"file://{origin_repo}", str(client_dir)],
+                check=True,
+            )
+
+            # 1. Version equals commit count (1)
+            self.assertEqual(mod._format_version(client_dir, short=True), "1")
+            ver_res = subprocess.run(
+                [str(client_dir / "agent-proxy"), "version"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("agent-proxy v1 (", ver_res.stdout)
+
+            # 2. Add a 2nd commit to origin and run `update`
+            (origin_repo / "README.txt").write_text("v2\n", encoding="utf-8")
+            git(origin_repo, "add", "README.txt")
+            git(origin_repo, "commit", "-q", "-m", "commit 2")
+
+            upd_res = subprocess.run(
+                [str(client_dir / "agent-proxy"), "update"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("v1 (", upd_res.stdout)
+            self.assertIn("-> v2 (", upd_res.stdout)
+            self.assertEqual(mod._format_version(client_dir, short=True), "2")
+            self.assertTrue((client_dir / "README.txt").exists())
+
+            # 3. Re-running update reports already up to date
+            upd_again = subprocess.run(
+                [str(client_dir / "agent-proxy"), "update"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("Already up to date", upd_again.stdout)
+
+            # 4. Dirty tracked file blocks update unless --force is given
+            (client_dir / "README.txt").write_text("dirty\n", encoding="utf-8")
+            dirty_res = subprocess.run(
+                [str(client_dir / "agent-proxy"), "update"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(dirty_res.returncode, 0)
+            self.assertIn("Uncommitted changes", dirty_res.stderr)
+
+            force_res = subprocess.run(
+                [str(client_dir / "agent-proxy"), "update", "--force"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(force_res.returncode, 0)
+            self.assertEqual((client_dir / "README.txt").read_text(encoding="utf-8"), "v2\n")
+
     def test_end_to_end_http_connect_plain_http_and_socks5(self) -> None:
         async def run() -> None:
             recorded_targets = []

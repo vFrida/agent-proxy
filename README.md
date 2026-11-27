@@ -75,6 +75,8 @@ eval "$(./agent-proxy env)"         # Export proxy env vars into the current she
 | --- | --- |
 | `./agent-proxy install` | Add the `agent-proxy` directory to your shell `PATH` (supports zsh / bash / fish; alias `add-path`) |
 | `./agent-proxy uninstall` | Remove the `PATH` entry added by `install` (alias `remove-path`) |
+| `./agent-proxy version` | Show current version (total git commit count; also `-V` / `--version`) |
+| `./agent-proxy update` | Pull the latest version from GitHub (`--restart` to reload running daemon, `--force` to overwrite local edits) |
 | `./agent-proxy list` | List supported tools, detected install paths, and current wrap status |
 | `./agent-proxy wrap [agents...]` | Wrap the given tools (all detected tools if omitted) |
 | `./agent-proxy wrap --bin /path/to/cmd` | Additionally wrap a custom CLI path (repeatable) |

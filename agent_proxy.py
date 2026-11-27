@@ -1631,11 +1631,154 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_REPO_URL = "https://github.com/vFrida/agent-proxy.git"
+DEFAULT_UPDATE_REF = "main"
+
+
+def _run_git(repo_dir: Path, *git_args: str, check: bool = True) -> subprocess.CompletedProcess:
+    cmd = ["git", "-C", str(repo_dir), *git_args]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if check and res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip() or f"exit code {res.returncode}"
+        raise RuntimeError(f"git {' '.join(git_args)} failed: {detail}")
+    return res
+
+
+def _get_git_version(repo_dir: Optional[Path] = None) -> Tuple[Optional[int], Optional[str], bool]:
+    target_dir = repo_dir if repo_dir is not None else Path(__file__).resolve().parent
+    if not shutil.which("git") or not _path_exists_safe(target_dir / ".git"):
+        return None, None, False
+    count_res = _run_git(target_dir, "rev-list", "--count", "HEAD", check=False)
+    if count_res.returncode != 0:
+        return None, None, False
+    try:
+        commit_count = int(count_res.stdout.strip())
+    except ValueError:
+        return None, None, False
+    sha_res = _run_git(target_dir, "rev-parse", "--short", "HEAD", check=False)
+    short_sha = sha_res.stdout.strip() if sha_res.returncode == 0 else None
+    is_shallow = _path_exists_safe(target_dir / ".git" / "shallow")
+    return commit_count, short_sha, is_shallow
+
+
+def _format_version(repo_dir: Optional[Path] = None, short: bool = False) -> str:
+    count, sha, is_shallow = _get_git_version(repo_dir)
+    if count is None:
+        return "0" if short else "agent-proxy unknown (not a git repository)"
+    if short:
+        return str(count)
+    parts = [f"agent-proxy v{count}"]
+    if sha:
+        parts.append(f"({sha})")
+    if is_shallow:
+        parts.append("[shallow]")
+    return " ".join(parts)
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    repo_dir = Path(os.path.expanduser(args.dir)).resolve() if getattr(args, "dir", None) else Path(__file__).resolve().parent
+    print(_format_version(repo_dir, short=getattr(args, "short", False)))
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    if not shutil.which("git"):
+        raise RuntimeError("git is required to update agent-proxy.")
+
+    repo_dir = Path(os.path.expanduser(args.dir)).resolve() if args.dir else Path(__file__).resolve().parent
+    if not repo_dir.is_dir():
+        raise ValueError(f"Directory does not exist: {repo_dir}")
+
+    explicit_url = (args.repo_url or os.environ.get("AGENT_PROXY_REPO_URL") or "").strip()
+    explicit_ref = (args.ref or os.environ.get("AGENT_PROXY_REF") or "").strip()
+    is_git_repo = _path_exists_safe(repo_dir / ".git")
+
+    old_count, old_sha, _ = _get_git_version(repo_dir)
+
+    if is_git_repo:
+        # Determine target ref (explicit -> current branch -> default main)
+        ref = explicit_ref
+        if not ref:
+            branch_res = _run_git(repo_dir, "symbolic-ref", "--short", "HEAD", check=False)
+            ref = branch_res.stdout.strip() if branch_res.returncode == 0 and branch_res.stdout.strip() else DEFAULT_UPDATE_REF
+
+        # Determine remote URL
+        if explicit_url:
+            repo_url = explicit_url
+            set_res = _run_git(repo_dir, "remote", "set-url", "origin", repo_url, check=False)
+            if set_res.returncode != 0:
+                _run_git(repo_dir, "remote", "add", "origin", repo_url)
+        else:
+            url_res = _run_git(repo_dir, "remote", "get-url", "origin", check=False)
+            if url_res.returncode == 0 and url_res.stdout.strip():
+                repo_url = url_res.stdout.strip()
+            else:
+                repo_url = DEFAULT_REPO_URL
+                _run_git(repo_dir, "remote", "add", "origin", repo_url)
+
+        # Refuse to clobber uncommitted tracked changes unless --force
+        status_res = _run_git(repo_dir, "status", "--porcelain", "--untracked-files=no")
+        if status_res.stdout.strip() and not args.force:
+            raise RuntimeError(
+                f"Uncommitted changes detected in {repo_dir}. "
+                "Commit or stash them first, or re-run with `agent-proxy update --force`."
+            )
+
+        print(f"Fetching latest changes from {repo_url} ({ref})...")
+        if _path_exists_safe(repo_dir / ".git" / "shallow"):
+            unshallow_res = _run_git(repo_dir, "fetch", "--unshallow", "origin", ref, check=False)
+            if unshallow_res.returncode != 0:
+                _run_git(repo_dir, "fetch", "origin", ref)
+        else:
+            _run_git(repo_dir, "fetch", "origin", ref)
+
+        _run_git(repo_dir, "checkout", "-f", "-B", ref, "FETCH_HEAD")
+    else:
+        repo_url = explicit_url or DEFAULT_REPO_URL
+        ref = explicit_ref or DEFAULT_UPDATE_REF
+        print(f"Initializing git repository in {repo_dir} from {repo_url} ({ref})...")
+        _run_git(repo_dir, "init", "-q")
+        _run_git(repo_dir, "remote", "add", "origin", repo_url)
+        _run_git(repo_dir, "fetch", "origin", ref)
+        _run_git(repo_dir, "checkout", "-f", "-B", ref, "FETCH_HEAD")
+
+    for exe_name in ("agent-proxy", "agent_proxy.py"):
+        exe_path = repo_dir / exe_name
+        if exe_path.is_file():
+            os.chmod(exe_path, 0o755)
+
+    new_count, new_sha, _ = _get_git_version(repo_dir)
+    if old_sha and new_sha and old_sha == new_sha:
+        print(f"Already up to date: {_format_version(repo_dir)}")
+        return 0
+
+    if old_count is not None and new_count is not None:
+        old_label = f"v{old_count} ({old_sha})" if old_sha else f"v{old_count}"
+        new_label = f"v{new_count} ({new_sha})" if new_sha else f"v{new_count}"
+        print(f"Updated agent-proxy: {old_label} -> {new_label}")
+    else:
+        print(f"Updated agent-proxy to {_format_version(repo_dir)}")
+
+    running_state = read_running_state()
+    if running_state:
+        if args.restart:
+            host = str(running_state.get("listen_host", DEFAULT_LISTEN_HOST))
+            port = int(running_state.get("listen_port", DEFAULT_LISTEN_PORT))
+            stop_daemon()
+            uri = resolve_upstream_uri(None)
+            new_state = start_daemon(uri, host, port, insecure=False, verbose=False)
+            print(f"Restarted proxy daemon (PID {new_state['pid']}) on {host}:{port}.")
+        else:
+            print("Note: proxy daemon is running; run `agent-proxy stop && agent-proxy start -d` (or `agent-proxy update --restart`) to reload.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent-proxy",
         description="Zero-dependency local proxy & multi-agent CLI wrapper (Antigravity / Claude / Codex / Cursor).",
     )
+    p.add_argument("-V", "--version", action="version", version=_format_version())
     sub = p.add_subparsers(dest="command", required=True)
 
     # start
@@ -1723,6 +1866,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_uninstall.add_argument("--rc", metavar="PATH", help="Explicit shell rc file path to clean")
     p_uninstall.set_defaults(func=cmd_uninstall)
+
+    # version
+    p_version = sub.add_parser("version", help="Show version (total git commit count)")
+    p_version.add_argument("--short", action="store_true", help="Print only the numeric commit count")
+    p_version.add_argument("--dir", metavar="PATH", help="Repository directory (default: agent-proxy directory)")
+    p_version.set_defaults(func=cmd_version)
+
+    # update
+    p_update = sub.add_parser("update", aliases=["upgrade"], help="Pull the latest version of agent-proxy from GitHub")
+    p_update.add_argument("--ref", help="Git branch, tag, or commit to update to (default: current branch or main)")
+    p_update.add_argument("--repo-url", help=f"Git repository URL (default: current origin or {DEFAULT_REPO_URL})")
+    p_update.add_argument("--dir", metavar="PATH", help="Repository directory to update (default: agent-proxy directory)")
+    p_update.add_argument("--force", action="store_true", help="Overwrite uncommitted local changes to tracked files")
+    p_update.add_argument("--restart", action="store_true", help="Restart the background proxy daemon if running")
+    p_update.set_defaults(func=cmd_update)
 
     return p
 

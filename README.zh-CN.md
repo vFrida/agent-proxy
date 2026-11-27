@@ -75,6 +75,8 @@ eval "$(./agent-proxy env)"         # 在当前终端会话临时导出代理环
 | --- | --- |
 | `./agent-proxy install` | 将 `agent-proxy` 目录添加到 Shell `PATH` 环境变量（支持 zsh / bash / fish；别名 `add-path`） |
 | `./agent-proxy uninstall` | 移除由 `install` 添加的 `PATH` 环境变量配置（别名 `remove-path`） |
+| `./agent-proxy version` | 查看当前版本（等于仓库总提交数；也支持 `-V` / `--version`） |
+| `./agent-proxy update` | 从 GitHub 拉取最新版本（可加 `--restart` 自动重启守护进程、`--force` 覆盖本地修改） |
 | `./agent-proxy list` | 列出支持的工具、检测到的安装路径及当前接管状态 |
 | `./agent-proxy wrap [agents...]` | 接管指定工具（不填则接管全部已检测到的工具） |
 | `./agent-proxy wrap --bin /path/to/cmd` | 额外包装其它自定义 CLI 路径（可重复） |
