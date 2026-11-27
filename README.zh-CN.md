@@ -21,6 +21,7 @@
 ```bash
 cd ~/agent-proxy
 
+./agent-proxy install               # 可选：将 agent-proxy 目录添加到 PATH，之后可在任意目录直接运行
 ./agent-proxy list                  # 查看本机已检测到的工具与接管状态
 ./agent-proxy wrap                  # 首次会提示输入节点 URI，然后一次性接管所有已检测到的工具
 ./agent-proxy wrap agy claude codex # 或只接管指定工具
@@ -56,6 +57,8 @@ eval "$(./agent-proxy env)"         # 在当前终端会话临时导出代理环
 
 | 命令 | 说明 |
 | --- | --- |
+| `./agent-proxy install` | 将 `agent-proxy` 目录添加到 Shell `PATH` 环境变量（支持 zsh / bash / fish；别名 `add-path`） |
+| `./agent-proxy uninstall` | 移除由 `install` 添加的 `PATH` 环境变量配置（别名 `remove-path`） |
 | `./agent-proxy list` | 列出支持的工具、检测到的安装路径及当前接管状态 |
 | `./agent-proxy wrap [agents...]` | 接管指定工具（不填则接管全部已检测到的工具） |
 | `./agent-proxy wrap --bin /path/to/cmd` | 额外包装其它自定义 CLI 路径（可重复） |

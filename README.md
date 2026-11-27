@@ -21,6 +21,7 @@ Configure your own upstream VLESS node first: running `wrap` or `start -d` witho
 ```bash
 cd ~/agent-proxy
 
+./agent-proxy install               # Optional: add agent-proxy to PATH so you can run it from anywhere
 ./agent-proxy list                  # Show detected tools and their wrap status
 ./agent-proxy wrap                  # Prompts for node URI on first use, then wraps every detected tool
 ./agent-proxy wrap agy claude codex # Or wrap only the specified tools
@@ -56,6 +57,8 @@ eval "$(./agent-proxy env)"         # Export proxy env vars into the current she
 
 | Command | Description |
 | --- | --- |
+| `./agent-proxy install` | Add the `agent-proxy` directory to your shell `PATH` (supports zsh / bash / fish; alias `add-path`) |
+| `./agent-proxy uninstall` | Remove the `PATH` entry added by `install` (alias `remove-path`) |
 | `./agent-proxy list` | List supported tools, detected install paths, and current wrap status |
 | `./agent-proxy wrap [agents...]` | Wrap the given tools (all detected tools if omitted) |
 | `./agent-proxy wrap --bin /path/to/cmd` | Additionally wrap a custom CLI path (repeatable) |

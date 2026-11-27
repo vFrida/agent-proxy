@@ -210,6 +210,50 @@ class TestAgentProxy(unittest.TestCase):
                 mod.STATE_DIR = orig_state
                 mod.WRAPPED_FILE = orig_wrapped
 
+    def test_install_and_uninstall_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo_dir = tmp_path / "agent-proxy"
+            repo_dir.mkdir()
+            moved_dir = tmp_path / "moved-agent-proxy"
+            moved_dir.mkdir()
+
+            # 1. zsh: add, idempotent re-add, update path, uninstall
+            zshrc = tmp_path / ".zshrc"
+            zshrc.write_text("# existing config\nexport FOO=bar\n", encoding="utf-8")
+
+            self.assertEqual(mod._install_to_path(repo_dir, zshrc, "zsh"), "added")
+            text = zshrc.read_text(encoding="utf-8")
+            self.assertIn(f'export PATH="{repo_dir}:$PATH"  {mod.PATH_MARKER}', text)
+            self.assertIn("export FOO=bar", text)
+
+            self.assertEqual(mod._install_to_path(repo_dir, zshrc, "zsh"), "exists")
+            self.assertEqual(zshrc.read_text(encoding="utf-8").count(mod.PATH_MARKER), 1)
+
+            self.assertEqual(mod._install_to_path(moved_dir, zshrc, "zsh"), "updated")
+            updated_text = zshrc.read_text(encoding="utf-8")
+            self.assertIn(f'export PATH="{moved_dir}:$PATH"  {mod.PATH_MARKER}', updated_text)
+            self.assertNotIn(str(repo_dir), updated_text)
+
+            self.assertTrue(mod._uninstall_from_path(zshrc))
+            cleaned_text = zshrc.read_text(encoding="utf-8")
+            self.assertNotIn(mod.PATH_MARKER, cleaned_text)
+            self.assertIn("export FOO=bar", cleaned_text)
+            self.assertFalse(mod._uninstall_from_path(zshrc))
+
+            # 2. Respect existing manual PATH entry without duplicating
+            manual_rc = tmp_path / ".bashrc"
+            manual_rc.write_text(f'export PATH="{repo_dir}:$PATH"\n', encoding="utf-8")
+            self.assertEqual(mod._install_to_path(repo_dir, manual_rc, "bash"), "exists")
+            self.assertNotIn(mod.PATH_MARKER, manual_rc.read_text(encoding="utf-8"))
+
+            # 3. fish shell syntax + parent directory creation
+            fish_rc = tmp_path / ".config" / "fish" / "config.fish"
+            self.assertEqual(mod._install_to_path(repo_dir, fish_rc, "fish"), "added")
+            self.assertIn(f'fish_add_path "{repo_dir}"  {mod.PATH_MARKER}', fish_rc.read_text(encoding="utf-8"))
+            self.assertTrue(mod._uninstall_from_path(fish_rc))
+            self.assertNotIn(mod.PATH_MARKER, fish_rc.read_text(encoding="utf-8"))
+
     def test_end_to_end_http_connect_plain_http_and_socks5(self) -> None:
         async def run() -> None:
             recorded_targets = []

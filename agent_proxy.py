@@ -1472,6 +1472,165 @@ def cmd_env(args: argparse.Namespace) -> int:
     return 0
 
 
+PATH_MARKER = "# agent-proxy-path"
+
+
+def _escape_double_quoted(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+
+
+def _detect_shell_and_rc(
+    shell_name: str = "auto",
+    rc_override: Optional[str] = None,
+    home: Optional[Path] = None,
+) -> Tuple[str, Path]:
+    home_dir = home if home is not None else Path.home()
+    shell = (shell_name or "auto").strip().lower()
+    if shell == "auto":
+        env_shell = Path(os.environ.get("SHELL", "")).name.lower()
+        if env_shell in ("zsh", "bash", "fish", "sh"):
+            shell = env_shell
+        elif sys.platform == "darwin":
+            shell = "zsh"
+        else:
+            shell = "bash"
+
+    if rc_override:
+        rc_path = Path(os.path.expanduser(rc_override))
+        if shell_name == "auto":
+            rc_name = rc_path.name.lower()
+            if "fish" in rc_name:
+                shell = "fish"
+            elif "zsh" in rc_name:
+                shell = "zsh"
+            elif "bash" in rc_name:
+                shell = "bash"
+        return shell, rc_path
+
+    if shell == "zsh":
+        return "zsh", home_dir / ".zshrc"
+    if shell == "fish":
+        return "fish", home_dir / ".config" / "fish" / "config.fish"
+    if shell == "bash":
+        if sys.platform == "darwin":
+            bash_profile = home_dir / ".bash_profile"
+            bashrc = home_dir / ".bashrc"
+            return "bash", bash_profile if (bash_profile.exists() or not bashrc.exists()) else bashrc
+        return "bash", home_dir / ".bashrc"
+    return "sh", home_dir / ".profile"
+
+
+def _path_export_line(bin_dir: Path, shell: str) -> str:
+    escaped = _escape_double_quoted(str(bin_dir))
+    if shell == "fish":
+        return f'fish_add_path "{escaped}"  {PATH_MARKER}'
+    return f'export PATH="{escaped}:$PATH"  {PATH_MARKER}'
+
+
+def _install_to_path(bin_dir: Path, rc_path: Path, shell: str) -> str:
+    """Add bin_dir to PATH in rc_path. Returns status: 'added', 'updated', or 'exists'."""
+    target_dir = Path(os.path.abspath(str(bin_dir)))
+    export_line = _path_export_line(target_dir, shell)
+
+    existing_lines: List[str] = []
+    if rc_path.exists():
+        existing_lines = rc_path.read_text(encoding="utf-8").splitlines()
+
+    # 1. Check for existing managed marker line
+    for idx, line in enumerate(existing_lines):
+        if PATH_MARKER in line:
+            if line.strip() == export_line.strip():
+                return "exists"
+            existing_lines[idx] = export_line
+            rc_path.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
+            return "updated"
+
+    # 2. Avoid duplicating a manual PATH entry for the exact same directory
+    dir_str = str(target_dir)
+    for line in existing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if dir_str in stripped and ("PATH" in stripped or "fish_add_path" in stripped):
+            return "exists"
+
+    # 3. Append new managed line
+    rc_path.parent.mkdir(parents=True, exist_ok=True)
+    if existing_lines and existing_lines[-1] != "":
+        existing_lines.append("")
+    existing_lines.append(export_line)
+    rc_path.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
+    return "added"
+
+
+def _uninstall_from_path(rc_path: Path) -> bool:
+    if not _path_exists_safe(rc_path):
+        return False
+    raw = rc_path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    new_lines = [line for line in lines if PATH_MARKER not in line]
+    if len(new_lines) == len(lines):
+        return False
+    # Clean up trailing blank line left behind by our appended block
+    while len(new_lines) >= 2 and new_lines[-1] == "" and new_lines[-2] == "":
+        new_lines.pop()
+    content = ("\n".join(new_lines) + "\n") if new_lines else ""
+    rc_path.write_text(content, encoding="utf-8")
+    return True
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    if args.remove:
+        return cmd_uninstall(args)
+    bin_dir = Path(os.path.expanduser(args.dir)).resolve() if args.dir else Path(__file__).resolve().parent
+    if not bin_dir.is_dir():
+        raise ValueError(f"Directory does not exist: {bin_dir}")
+    shell, rc_path = _detect_shell_and_rc(args.shell, args.rc)
+    status = _install_to_path(bin_dir, rc_path, shell)
+    if status == "exists":
+        print(f"PATH 中已包含 {bin_dir}（配置文件：{rc_path}），无需重复添加。")
+    elif status == "updated":
+        print(f"已更新 {rc_path} 中的 agent-proxy PATH 路径为：{bin_dir}")
+    else:
+        print(f"已将 {bin_dir} 添加到 PATH（写入：{rc_path}）")
+    print("运行以下命令使当前终端立即生效（新开终端自动生效）：")
+    print(f"  source {shlex.quote(str(rc_path))}")
+    print("生效后可在任意目录直接运行：agent-proxy status")
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    home = Path.home()
+    candidates: List[Path] = []
+    if getattr(args, "rc", None):
+        candidates.append(Path(os.path.expanduser(args.rc)))
+    else:
+        _, detected_rc = _detect_shell_and_rc(getattr(args, "shell", "auto"), None, home=home)
+        for p in (
+            detected_rc,
+            home / ".zshrc",
+            home / ".bashrc",
+            home / ".bash_profile",
+            home / ".profile",
+            home / ".config" / "fish" / "config.fish",
+        ):
+            if p not in candidates:
+                candidates.append(p)
+
+    removed_from: List[Path] = []
+    for rc_path in candidates:
+        if _uninstall_from_path(rc_path):
+            removed_from.append(rc_path)
+
+    if removed_from:
+        for rc_path in removed_from:
+            print(f"已从 {rc_path} 移除 agent-proxy PATH 配置。")
+        print("重开终端或重新 source 配置文件后生效。")
+    else:
+        print("未在 Shell 配置文件中发现由 agent-proxy 添加的 PATH 配置。")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent-proxy",
@@ -1532,6 +1691,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_env.add_argument("--intranet-no-proxy", action="store_true", help="Include intranet/private CIDRs in NO_PROXY")
     p_env.add_argument("--unset", action="store_true", help="Print unset statements instead of export")
     p_env.set_defaults(func=cmd_env)
+
+    # install (add agent-proxy directory to PATH)
+    p_install = sub.add_parser(
+        "install",
+        aliases=["add-path"],
+        help="Add the agent-proxy directory to your shell PATH",
+    )
+    p_install.add_argument(
+        "--shell",
+        choices=("auto", "zsh", "bash", "fish", "sh"),
+        default="auto",
+        help="Target shell (default: auto-detect from $SHELL)",
+    )
+    p_install.add_argument("--rc", metavar="PATH", help="Explicit shell rc file path to update")
+    p_install.add_argument("--dir", metavar="PATH", help="Directory to add to PATH (default: agent-proxy directory)")
+    p_install.add_argument("--remove", action="store_true", help="Remove agent-proxy PATH entry instead of adding")
+    p_install.set_defaults(func=cmd_install)
+
+    # uninstall (remove agent-proxy directory from PATH)
+    p_uninstall = sub.add_parser(
+        "uninstall",
+        aliases=["remove-path"],
+        help="Remove the agent-proxy PATH entry added by `install`",
+    )
+    p_uninstall.add_argument(
+        "--shell",
+        choices=("auto", "zsh", "bash", "fish", "sh"),
+        default="auto",
+        help="Target shell (default: auto-detect from $SHELL)",
+    )
+    p_uninstall.add_argument("--rc", metavar="PATH", help="Explicit shell rc file path to clean")
+    p_uninstall.set_defaults(func=cmd_uninstall)
 
     return p
 
