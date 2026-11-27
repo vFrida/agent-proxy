@@ -16,6 +16,22 @@
 
 ## 快速开始
 
+### 一键安装（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vFrida/agent-proxy/main/install.sh | bash
+```
+
+脚本会默认 `git clone` 到 `~/.agent-proxy` 并自动加入 Shell `PATH`。刷新终端（如 `source ~/.zshrc`）后即可直接运行：
+
+```bash
+agent-proxy list                  # 查看本机已检测到的工具与接管状态
+agent-proxy wrap                  # 首次会提示输入节点 URI，然后一次性接管所有已检测到的工具
+agent-proxy wrap agy claude codex # 或只接管指定工具
+```
+
+### 或从本地仓库直接运行
+
 首次使用前需配置你自己的上游 VLESS 节点：直接执行 `wrap` 或 `start -d` 时若尚未配置，会自动提示输入并保存到 `~/.agent-proxy/config.json`（也可通过 `--uri` 或环境变量 `AGENT_PROXY_URI` 传入）。
 
 ```bash
@@ -109,6 +125,7 @@ eval "$(./agent-proxy env)"         # 在当前终端会话临时导出代理环
 
 | 路径 | 说明 |
 | --- | --- |
+| `install.sh` | 一键 `curl \| bash` 安装与升级脚本 |
 | `agent-proxy` | CLI 启动器（`exec python3 agent_proxy.py "$@"`） |
 | `agent_proxy.py` | 本地代理与多工具接管实现 |
 | `test_agent_proxy.py` | 单元测试与本地回环集成测试 |

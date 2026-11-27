@@ -3,3 +3,10 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Runtime state files when installed into ~/.agent-proxy
+config.json
+wrapped.json
+proxy.pid
+state.json
+proxy.log

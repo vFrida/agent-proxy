@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -253,6 +254,87 @@ class TestAgentProxy(unittest.TestCase):
             self.assertIn(f'fish_add_path "{repo_dir}"  {mod.PATH_MARKER}', fish_rc.read_text(encoding="utf-8"))
             self.assertTrue(mod._uninstall_from_path(fish_rc))
             self.assertNotIn(mod.PATH_MARKER, fish_rc.read_text(encoding="utf-8"))
+
+    def test_install_sh_script(self) -> None:
+        repo_root = Path(__file__).resolve().parent
+        script = repo_root / "install.sh"
+        self.assertTrue(script.exists())
+        repo_url = f"file://{repo_root}"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            install_dir = tmp_path / ".agent-proxy"
+            rc_file = tmp_path / ".zshrc"
+
+            # 1. Fresh git clone into target directory
+            res = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--repo-url",
+                    repo_url,
+                    "--dir",
+                    str(install_dir),
+                    "--rc",
+                    str(rc_file),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("Installed to:", res.stdout)
+            self.assertTrue((install_dir / ".git").is_dir())
+            self.assertTrue((install_dir / "agent-proxy").exists())
+            self.assertTrue((install_dir / "agent_proxy.py").exists())
+            self.assertIn(str(install_dir.resolve()), rc_file.read_text(encoding="utf-8"))
+
+            # 2. Re-run updates existing clone cleanly without duplicating PATH
+            subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--repo-url",
+                    repo_url,
+                    "--dir",
+                    str(install_dir),
+                    "--rc",
+                    str(rc_file),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(rc_file.read_text(encoding="utf-8").count(mod.PATH_MARKER), 1)
+
+            # 3. Existing non-empty directory (e.g. already has config.json) preserves state
+            existing_dir = tmp_path / "existing-agent-proxy"
+            existing_dir.mkdir()
+            existing_cfg = existing_dir / "config.json"
+            existing_cfg.write_text('{"upstream_uri": "vless://keep"}\n', encoding="utf-8")
+            subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--repo-url",
+                    repo_url,
+                    "--dir",
+                    str(existing_dir),
+                    "--no-path",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertTrue((existing_dir / ".git").is_dir())
+            self.assertEqual(existing_cfg.read_text(encoding="utf-8"), '{"upstream_uri": "vless://keep"}\n')
+
+            # 4. Verify installed binary runs cleanly
+            help_res = subprocess.run(
+                [str(install_dir / "agent-proxy"), "--help"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("agent-proxy", help_res.stdout)
 
     def test_end_to_end_http_connect_plain_http_and_socks5(self) -> None:
         async def run() -> None:

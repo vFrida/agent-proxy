@@ -16,6 +16,22 @@ It listens on `127.0.0.1:17890` by default (both `http://` and `socks5h://`); lo
 
 ## Quick Start
 
+### One-line Install (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vFrida/agent-proxy/main/install.sh | bash
+```
+
+This clones `agent-proxy` into `~/.agent-proxy` and automatically adds it to your shell `PATH`. Reload your shell (e.g. `source ~/.zshrc`), then run:
+
+```bash
+agent-proxy list                  # Show detected tools and their wrap status
+agent-proxy wrap                  # Prompts for node URI on first use, then wraps every detected tool
+agent-proxy wrap agy claude codex # Or wrap only the specified tools
+```
+
+### Or Run from a Local Clone
+
 Configure your own upstream VLESS node first: running `wrap` or `start -d` without a saved config prompts for input and saves it to `~/.agent-proxy/config.json` (you can also pass `--uri` or the `AGENT_PROXY_URI` env var).
 
 ```bash
@@ -109,6 +125,7 @@ Or switch and save from the command line:
 
 | Path | Description |
 | --- | --- |
+| `install.sh` | One-line `curl \| bash` installer / updater |
 | `agent-proxy` | CLI launcher (`exec python3 agent_proxy.py "$@"`) |
 | `agent_proxy.py` | Local proxy and multi-tool wrapping implementation |
 | `test_agent_proxy.py` | Unit tests and loopback integration tests |
