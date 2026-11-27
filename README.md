@@ -2,9 +2,31 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Zero dependencies (Python 3 standard library only, no extra proxy client): turns an encrypted upstream node into a local **HTTP / HTTPS / SOCKS5 mixed proxy**, and uniformly wraps **Antigravity (`agy`), Claude Code (`claude`), OpenAI Codex (`codex`), Cursor (`cursor`)** plus any other CLI dev tool.
+**A lightweight, zero-dependency proxy wrapper built for CLI AI coding agents** (**Antigravity `agy`**, **Claude Code `claude`**, **OpenAI Codex `codex`**, **Cursor `cursor`**, and any other CLI tool).
 
-It listens on `127.0.0.1:17890` by default (both `http://` and `socks5h://`); loopback and intranet addresses are connected directly.
+Using only the Python 3 standard library (no external proxy client required), it turns an encrypted upstream node into a local **HTTP / HTTPS / SOCKS5 mixed proxy** (`127.0.0.1:17890` by default, with loopback and intranet traffic connected directly) and seamlessly routes wrapped CLI tools through it.
+
+## Why Agent Proxy
+
+CLI coding agents often hit network blocks or timeouts in restricted networks, remote Linux/SSH dev machines, or workstations where a system-wide VPN or GUI proxy client is unavailable or disruptive. `agent-proxy` is built for these scenarios:
+
+- **Per-CLI routing, no global side effects**: Route only the CLI tools you choose (`wrap`) or a single command (`run`), without changing system proxy settings or interfering with browsers, local services, or intranet traffic.
+- **Zero extra binaries, no root required**: Runs on Python 3's standard library alone—no Clash / Xray / sing-box installation and no `sudo`, making it ideal for headless servers, SSH sessions, and locked-down developer machines.
+- **Set once, transparent to use**: Wrap once and keep running `agy`, `claude`, `codex`, or `cursor` as usual. The wrapper auto-starts the local daemon on demand and injects the right env vars for Go, Node.js (`NODE_USE_ENV_PROXY=1`), Python, and Rust CLIs.
+- **Reversible & CLI-only**: `agent-proxy unwrap` restores original binaries and symlinks in place; system proxy settings and desktop (GUI) apps are never modified.
+
+Concrete scenarios:
+
+| Scenario | Command |
+| --- | --- |
+| Every AI coding CLI should use the proxy from now on | `agent-proxy wrap` (once) |
+| Only some tools should use it | `agent-proxy wrap claude codex` or `agent-proxy wrap --bin /path/to/tool` |
+| Try it once without touching any binary | `agent-proxy run <cmd>` or `eval "$(agent-proxy env)"` |
+| Switch upstream node | `agent-proxy start -d --uri 'vless://...' --save` (the daemon restarts automatically) |
+| Inspect what is happening | `agent-proxy status`, `agent-proxy list`, `~/.agent-proxy/proxy.log` |
+| Undo everything | `agent-proxy unwrap` |
+
+**Scope and limitations**: this is not a VPN/TUN client, not a rule-based or multi-node router, and it does not proxy UDP/QUIC. The built-in engine only speaks **VLESS over TCP with `security=tls|none`** (no `ws` / `grpc` / `xhttp`); use xray or sing-box for those transports. Loopback and intranet hosts are always connected directly via `NO_PROXY`.
 
 ---
 

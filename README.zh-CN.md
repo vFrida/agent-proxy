@@ -2,9 +2,31 @@
 
 [English](README.md) | 简体中文
 
-零依赖（仅用 Python 3 标准库，无需额外代理客户端）：把上游加密节点转为本地 **HTTP / HTTPS / SOCKS5 混合代理**，并支持统一接管 **Antigravity (`agy`)、Claude Code (`claude`)、OpenAI Codex (`codex`)、Cursor (`cursor`)** 及任意其它 CLI 开发工具。
+**专为 CLI AI 编程助手设计的轻量级零依赖代理工具**，支持 **Antigravity (`agy`)、Claude Code (`claude`)、OpenAI Codex (`codex`)、Cursor (`cursor`)** 及任意其它 CLI 开发工具。
 
-默认本地监听 `127.0.0.1:17890`（同时支持 `http://` 和 `socks5h://`），本机与内网地址自动直连。
+仅依赖 Python 3 标准库（无需安装额外代理客户端），将上游加密节点转为本地 **HTTP / HTTPS / SOCKS5 混合代理**（默认监听 `127.0.0.1:17890`，本机与内网地址自动直连），并让被接管的 CLI 工具无感通过代理访问网络。
+
+## 目标用途
+
+在受限网络环境、远程 Linux / SSH 开发机，或不方便开启全局 VPN / 桌面代理客户端的办公电脑上，CLI 编程助手经常面临无法直连、超时，或全局代理误伤内网与其它应用的问题。`agent-proxy` 旨在解决这些场景：
+
+- **仅针对指定 CLI 定向代理，不影响全局网络**：通过 `wrap` 只接管选定的 CLI 工具（或用 `run` 单次套代理），不修改系统代理设置，不干扰浏览器、本机服务与内网访问。
+- **零外部客户端、无需 root 权限**：纯 Python 3 标准库实现，无需安装 Clash / Xray / sing-box，也无需 `sudo`，适合无界面的远程服务器、SSH 会话和权限受限的开发机。
+- **一次配置，日常无感使用**：接管后照常直接运行 `agy`、`claude`、`codex`、`cursor` 即可，包装脚本会自动按需拉起本地代理并注入兼容 Go / Node.js（含 `NODE_USE_ENV_PROXY=1`）/ Python / Rust 工具的代理环境变量。
+- **随时可还原、仅面向 CLI**：执行 `agent-proxy unwrap` 即可原地恢复原始可执行文件或软链；不会修改系统全局代理或任何桌面（GUI）应用。
+
+具体场景：
+
+| 场景 | 命令 |
+| --- | --- |
+| 让所有 AI 编码 CLI 长期走代理 | `agent-proxy wrap`（执行一次即可） |
+| 只让部分工具走代理 | `agent-proxy wrap claude codex` 或 `agent-proxy wrap --bin /path/to/tool` |
+| 不改动任何程序，临时试一次 | `agent-proxy run <cmd>` 或 `eval "$(agent-proxy env)"` |
+| 切换上游节点 | `agent-proxy start -d --uri 'vless://...' --save`（守护进程自动重启） |
+| 排查当前状态 | `agent-proxy status`、`agent-proxy list`、`~/.agent-proxy/proxy.log` |
+| 全部还原 | `agent-proxy unwrap` |
+
+**适用范围与限制**：它不是 VPN/TUN 客户端，也不是规则化或多节点路由器，不转发 UDP/QUIC。内置引擎只支持 **VLESS over TCP + `security=tls|none`**（不支持 `ws` / `grpc` / `xhttp`），这类传输请使用 xray 或 sing-box。回环地址与内网域名始终经 `NO_PROXY` 直连。
 
 ---
 
