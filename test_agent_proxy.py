@@ -210,30 +210,6 @@ class TestAgentProxy(unittest.TestCase):
                 mod.STATE_DIR = orig_state
                 mod.WRAPPED_FILE = orig_wrapped
 
-    def test_cursor_settings_configure_and_restore(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            settings_path = tmp_path / "Cursor" / "User" / "settings.json"
-            settings_path.parent.mkdir(parents=True)
-            settings_path.write_text(
-                json.dumps({"editor.fontSize": 14, "http.proxy": "http://127.0.0.1:9999"}, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            backup_path = tmp_path / "cursor_backup.json"
-
-            self.assertTrue(mod._configure_cursor_settings(settings_path, "127.0.0.1", 17890, backup_path))
-            updated = json.loads(settings_path.read_text(encoding="utf-8"))
-            self.assertEqual(updated["http.proxy"], "http://127.0.0.1:17890")
-            self.assertEqual(updated["http.proxySupport"], "override")
-            self.assertEqual(updated["editor.fontSize"], 14)
-
-            self.assertTrue(mod._restore_cursor_settings(backup_path))
-            restored = json.loads(settings_path.read_text(encoding="utf-8"))
-            self.assertEqual(restored["http.proxy"], "http://127.0.0.1:9999")
-            self.assertNotIn("http.proxySupport", restored)
-            self.assertEqual(restored["editor.fontSize"], 14)
-            self.assertFalse(backup_path.exists())
-
     def test_end_to_end_http_connect_plain_http_and_socks5(self) -> None:
         async def run() -> None:
             recorded_targets = []

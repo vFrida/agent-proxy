@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Agent Proxy Bridge & Multi-Tool Launcher
-========================================
+Agent Proxy Bridge & CLI Wrapper
+================================
 
 Zero-dependency Python 3.9+ tool that:
 1. Runs a local mixed HTTP / HTTPS CONNECT / SOCKS5 proxy backed by an
    encrypted TLS upstream tunnel (no external proxy binary required).
-2. Wraps CLI / IDE coding agents (Antigravity `agy`, Claude Code `claude`,
+2. Wraps CLI coding agents (Antigravity `agy`, Claude Code `claude`,
    OpenAI `codex`, `cursor`, or any custom binary) so invocations inherit
    proxy settings and auto-start the local daemon.
-3. Provides start / stop / status / list / wrap / unwrap / run / launch / env commands.
+3. Provides start / stop / status / list / wrap / unwrap / run / env commands.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import ipaddress
 import json
 import logging
 import os
-import plistlib
 import shlex
 import shutil
 import signal
@@ -46,7 +45,6 @@ STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "proxy.log"
 CONFIG_FILE = STATE_DIR / "config.json"
 WRAPPED_FILE = STATE_DIR / "wrapped.json"
-CURSOR_BACKUP_FILE = STATE_DIR / "cursor_settings_backup.json"
 
 logger = logging.getLogger("agent_proxy")
 
@@ -939,23 +937,17 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Multi-Agent Wrapper, GUI Integration & Launcher
+# Multi-Agent CLI Wrapper
 # ---------------------------------------------------------------------------
 
 WRAPPER_MARKER = "# agent-proxy-wrapper v2"
 LEGACY_WRAPPER_MARKERS = (WRAPPER_MARKER, "# agy-proxy-wrapper v1")
 LOCAL_BIN = Path.home() / ".local" / "bin"
-LAUNCH_AGENT = Path.home() / "Library" / "LaunchAgents" / "com.agent-proxy.env.plist"
 DEFAULT_NO_PROXY = "localhost,127.0.0.1,::1,.local"
-GUI_NO_PROXY = (
+INTRANET_NO_PROXY = (
     "localhost,127.0.0.1,::1,.local,"
     ".pdd.net,.pdd-test.net,.ddmcsup.com,"
     "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-)
-CHROMIUM_BYPASS_LIST = (
-    "localhost;127.0.0.1;[::1];*.local;"
-    "*.pdd.net;*.pdd-test.net;*.ddmcsup.com;"
-    "10.0.0.0/8;172.16.0.0/12;192.168.0.0/16"
 )
 
 
@@ -966,9 +958,6 @@ class AgentProfile:
     bin_names: Tuple[str, ...]
     extra_paths: Tuple[Path, ...]
     process_names: Tuple[str, ...]
-    app_paths: Tuple[Path, ...] = ()
-    cursor_settings: Optional[Path] = None
-    chromium_flags: bool = False
 
 
 def _build_agent_profiles() -> Dict[str, AgentProfile]:
@@ -998,11 +987,6 @@ def _build_agent_profiles() -> Dict[str, AgentProfile]:
                 home / ".asdf" / "shims" / "claude",
             ),
             process_names=("claude", "claude.real"),
-            app_paths=(
-                Path("/Applications/Claude.app"),
-                home / "Applications" / "Claude.app",
-            ),
-            chromium_flags=True,
         ),
         "codex": AgentProfile(
             name="codex",
@@ -1021,7 +1005,7 @@ def _build_agent_profiles() -> Dict[str, AgentProfile]:
         ),
         "cursor": AgentProfile(
             name="cursor",
-            display_name="Cursor (cursor / Cursor.app)",
+            display_name="Cursor (cursor)",
             bin_names=("cursor",),
             extra_paths=(
                 home / ".local" / "bin" / "cursor",
@@ -1029,12 +1013,6 @@ def _build_agent_profiles() -> Dict[str, AgentProfile]:
                 Path("/opt/homebrew/bin/cursor"),
             ),
             process_names=("cursor", "cursor.real"),
-            app_paths=(
-                Path("/Applications/Cursor.app"),
-                home / "Applications" / "Cursor.app",
-            ),
-            cursor_settings=home / "Library" / "Application Support" / "Cursor" / "User" / "settings.json",
-            chromium_flags=True,
         ),
     }
 
@@ -1173,10 +1151,6 @@ def _proxy_env(host: str, port: int, no_proxy: Optional[str] = None) -> Dict[str
     }
 
 
-def _gui_env(host: str, port: int) -> Dict[str, str]:
-    return _proxy_env(host, port, no_proxy=GUI_NO_PROXY)
-
-
 def _wrapper_script(bin_name: str, host: str, port: int) -> str:
     app = Path(__file__).resolve()
     py = sys.executable or "/usr/bin/python3"
@@ -1234,37 +1208,6 @@ exec "$REAL" "$@"
 '''
 
 
-def _launchctl_env_command(host: str, port: int, unset: bool = False) -> str:
-    if unset:
-        keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-                "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY")
-        return "; ".join(f"/bin/launchctl unsetenv {k}" for k in keys)
-    return "; ".join(
-        f"/bin/launchctl setenv {k} '{v}'" for k, v in _gui_env(host, port).items()
-    )
-
-
-def _install_gui_env(host: str, port: int) -> None:
-    LAUNCH_AGENT.parent.mkdir(parents=True, exist_ok=True)
-    plist = {
-        "Label": "com.agent-proxy.env",
-        "ProgramArguments": ["/bin/sh", "-c", _launchctl_env_command(host, port)],
-        "RunAtLoad": True,
-        "ProcessType": "Background",
-    }
-    with open(LAUNCH_AGENT, "wb") as f:
-        plistlib.dump(plist, f)
-    subprocess.run(["/bin/sh", "-c", _launchctl_env_command(host, port)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def _remove_gui_env() -> None:
-    if LAUNCH_AGENT.exists():
-        LAUNCH_AGENT.unlink()
-    subprocess.run(["/bin/sh", "-c", _launchctl_env_command(DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT, unset=True)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
 def _wrap_one(target: Path, host: str, port: int) -> bool:
     if not _path_exists_entry(target):
         return False
@@ -1289,78 +1232,6 @@ def _unwrap_one(target: Path) -> bool:
         print(f"  已还原：{target}")
         return True
     return False
-
-
-def _configure_cursor_settings(
-    settings_path: Path,
-    host: str,
-    port: int,
-    backup_path: Path = CURSOR_BACKUP_FILE,
-) -> bool:
-    if not settings_path.parent.exists():
-        return False
-    data: Dict[str, object] = {}
-    if settings_path.exists():
-        raw = settings_path.read_text(encoding="utf-8")
-        if raw.strip():
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                print(
-                    f"  提示：{settings_path} 含注释或非标准 JSON，未自动修改；"
-                    f'请手动添加 `"http.proxy": "http://{host}:{port}"` 和 `"http.proxySupport": "override"`。'
-                )
-                return False
-            if not isinstance(parsed, dict):
-                return False
-            data = parsed
-
-    if not backup_path.exists():
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        backup = {
-            "settings_path": str(settings_path),
-            "had_http_proxy": "http.proxy" in data,
-            "http_proxy": data.get("http.proxy"),
-            "had_http_proxy_support": "http.proxySupport" in data,
-            "http_proxy_support": data.get("http.proxySupport"),
-        }
-        backup_path.write_text(json.dumps(backup, indent=2) + "\n", encoding="utf-8")
-
-    data["http.proxy"] = f"http://{host}:{port}"
-    data["http.proxySupport"] = "override"
-    settings_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"  已配置 Cursor 代理：{settings_path}")
-    return True
-
-
-def _restore_cursor_settings(backup_path: Path = CURSOR_BACKUP_FILE) -> bool:
-    if not backup_path.exists():
-        return False
-    try:
-        backup = json.loads(backup_path.read_text(encoding="utf-8"))
-        settings_path = Path(str(backup["settings_path"]))
-    except Exception:
-        return False
-
-    if settings_path.exists():
-        try:
-            data = json.loads(settings_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = None
-        if isinstance(data, dict):
-            if backup.get("had_http_proxy"):
-                data["http.proxy"] = backup.get("http_proxy")
-            else:
-                data.pop("http.proxy", None)
-            if backup.get("had_http_proxy_support"):
-                data["http.proxySupport"] = backup.get("http_proxy_support")
-            else:
-                data.pop("http.proxySupport", None)
-            settings_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            print(f"  已还原 Cursor 配置：{settings_path}")
-
-    backup_path.unlink(missing_ok=True)
-    return True
 
 
 def _running_agent_pids(process_names: Iterable[str]) -> List[int]:
@@ -1439,7 +1310,6 @@ def cmd_list(_args: argparse.Namespace) -> int:
     print("支持的海外开发工具 / Coding Agents：")
     for name, profile in AGENT_PROFILES.items():
         bins = _discover_profile_bins(profile)
-        apps = [p for p in profile.app_paths if _path_exists_safe(p)]
         if bins:
             parts = []
             for b in bins:
@@ -1448,14 +1318,7 @@ def cmd_list(_args: argparse.Namespace) -> int:
             bin_info = ", ".join(parts)
         else:
             bin_info = "未检测到 CLI"
-        extra = []
-        if apps:
-            extra.append(f"App: {', '.join(str(a) for a in apps)}")
-        if profile.cursor_settings and _path_exists_safe(profile.cursor_settings.parent):
-            cfg_tag = "CONFIGURED" if _path_exists_safe(CURSOR_BACKUP_FILE) else "未接管"
-            extra.append(f"settings.json [{cfg_tag}]")
-        suffix = f" | {'; '.join(extra)}" if extra else ""
-        print(f"  - {name:<8} {profile.display_name:<28} {bin_info}{suffix}")
+        print(f"  - {name:<8} {profile.display_name:<28} {bin_info}")
 
     known_paths = {
         os.path.abspath(str(p))
@@ -1510,13 +1373,7 @@ def cmd_wrap(args: argparse.Namespace) -> int:
 
     wrapped = [t for t in targets if _wrap_one(t, args.host, args.port)]
 
-    cursor_configured = False
-    if include_profiles and "cursor" in selected_names and not args.no_cursor_settings:
-        cursor_settings = AGENT_PROFILES["cursor"].cursor_settings
-        if cursor_settings is not None:
-            cursor_configured = _configure_cursor_settings(cursor_settings, args.host, args.port)
-
-    if not wrapped and not cursor_configured and not args.gui:
+    if not wrapped:
         names_str = ", ".join(selected_names) if include_profiles else ", ".join(args.bin or [])
         print(
             f"Error: 未检测到可包装的 CLI（目标：{names_str}）。"
@@ -1526,15 +1383,6 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         return 1
 
     print(f"代理：http://{args.host}:{args.port}（未启动时会自动拉起）")
-
-    if args.gui:
-        _install_gui_env(args.host, args.port)
-        print(f"已安装 GUI 环境注入：{LAUNCH_AGENT}")
-        print("  影响范围：所有从 Finder/Dock 启动的 GUI 应用（含 Antigravity IDE / Cursor / Claude Desktop 等）")
-        print("  NO_PROXY 已加入内网域与私有网段，避免影响公司服务")
-    else:
-        print("提示：若桌面 IDE（Cursor / Claude Desktop / Antigravity 插件宿主）继承不到环境变量，")
-        print("      可执行 `./agent-proxy wrap --gui` 或 `./agent-proxy launch cursor`。")
 
     proc_names: Set[str] = set()
     if include_profiles:
@@ -1588,16 +1436,9 @@ def cmd_unwrap(args: argparse.Namespace) -> int:
         if _unwrap_one(target):
             restored += 1
 
-    cursor_restored = False
-    if unwrap_all or "cursor" in selected_names:
-        cursor_restored = _restore_cursor_settings()
+    if restored == 0:
+        print("未发现需要还原的包装脚本。")
 
-    if restored == 0 and not cursor_restored:
-        print("未发现需要还原的包装脚本或配置。")
-
-    if unwrap_all or args.gui:
-        _remove_gui_env()
-        print("已移除 GUI 环境注入（launchctl 变量已清除）。")
     return 0
 
 
@@ -1617,54 +1458,6 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_launch(args: argparse.Namespace) -> int:
-    target = args.app
-    key = target.strip().lower()
-    canonical = AGENT_ALIASES.get(key)
-    app_arg = target
-    use_chromium_flags = key in ("cursor", "claude", "code", "vscode", "windsurf")
-
-    if canonical and canonical in AGENT_PROFILES:
-        profile = AGENT_PROFILES[canonical]
-        use_chromium_flags = profile.chromium_flags
-        for candidate in profile.app_paths:
-            if candidate.exists():
-                app_arg = str(candidate)
-                break
-        else:
-            if profile.app_paths:
-                app_arg = profile.app_paths[0].stem
-
-    _ensure_proxy_running(args.host, args.port)
-    env = os.environ.copy()
-    env.update(_gui_env(args.host, args.port))
-
-    open_cmd = ["open"]
-    if args.new:
-        open_cmd.append("-n")
-    open_cmd.extend(["-a", app_arg])
-
-    extra_args: List[str] = []
-    if use_chromium_flags:
-        extra_args.extend([
-            f"--proxy-server=http://{args.host}:{args.port}",
-            f"--proxy-bypass-list={CHROMIUM_BYPASS_LIST}",
-        ])
-    user_args = list(args.app_args or [])
-    if user_args and user_args[0] == "--":
-        user_args = user_args[1:]
-    extra_args.extend(user_args)
-    if extra_args:
-        open_cmd.append("--args")
-        open_cmd.extend(extra_args)
-
-    res = subprocess.run(open_cmd, env=env)
-    if res.returncode != 0:
-        raise RuntimeError(f"Failed to launch {app_arg} (exit code {res.returncode})")
-    print(f"已通过代理 http://{args.host}:{args.port} 启动：{app_arg}")
-    return 0
-
-
 def cmd_env(args: argparse.Namespace) -> int:
     keys = (
         "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
@@ -1673,7 +1466,7 @@ def cmd_env(args: argparse.Namespace) -> int:
     if args.unset:
         print("unset " + " ".join(keys))
         return 0
-    env_map = _proxy_env(args.host, args.port, no_proxy=GUI_NO_PROXY if args.gui_no_proxy else None)
+    env_map = _proxy_env(args.host, args.port, no_proxy=INTRANET_NO_PROXY if args.intranet_no_proxy else None)
     for k, v in env_map.items():
         print(f"export {k}={shlex.quote(v)}")
     return 0
@@ -1682,7 +1475,7 @@ def cmd_env(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent-proxy",
-        description="Zero-dependency local proxy & multi-agent launcher (Antigravity / Claude / Codex / Cursor).",
+        description="Zero-dependency local proxy & multi-agent CLI wrapper (Antigravity / Claude / Codex / Cursor).",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1716,16 +1509,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_wrap.add_argument("--host", default=DEFAULT_LISTEN_HOST, help=f"Proxy host (default: {DEFAULT_LISTEN_HOST})")
     p_wrap.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT, help=f"Proxy port (default: {DEFAULT_LISTEN_PORT})")
     p_wrap.add_argument("--bin", action="append", metavar="PATH", help="额外要包装的 CLI 路径（可重复）")
-    p_wrap.add_argument("--gui", action="store_true", help="Also inject proxy env into GUI apps (LaunchAgent + launchctl setenv)")
-    p_wrap.add_argument("--no-cursor-settings", action="store_true", help="Skip updating Cursor settings.json when wrapping cursor")
     p_wrap.add_argument("--restart", action="store_true", help="终止正在运行的目标进程，使其重启后生效")
     p_wrap.set_defaults(func=cmd_wrap)
 
     # unwrap
-    p_unwrap = sub.add_parser("unwrap", help="Restore wrapped CLI tools and remove GUI/Cursor proxy settings")
+    p_unwrap = sub.add_parser("unwrap", help="Restore wrapped CLI tools")
     p_unwrap.add_argument("agents", nargs="*", help="Target agents to unwrap (default: all wrapped)")
     p_unwrap.add_argument("--bin", action="append", metavar="PATH", help="额外要还原的 CLI 路径（可重复）")
-    p_unwrap.add_argument("--gui", action="store_true", help="Also remove GUI LaunchAgent env injection")
     p_unwrap.set_defaults(func=cmd_unwrap)
 
     # run
@@ -1735,20 +1525,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("cmd", nargs=argparse.REMAINDER, help="Command and arguments to execute")
     p_run.set_defaults(func=cmd_run)
 
-    # launch
-    p_launch = sub.add_parser("launch", help="Launch a macOS GUI app (e.g. cursor, claude) through the local proxy")
-    p_launch.add_argument("app", help="App name or .app path (e.g. cursor, claude, /Applications/Cursor.app)")
-    p_launch.add_argument("--host", default=DEFAULT_LISTEN_HOST, help=f"Proxy host (default: {DEFAULT_LISTEN_HOST})")
-    p_launch.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT, help=f"Proxy port (default: {DEFAULT_LISTEN_PORT})")
-    p_launch.add_argument("-n", "--new", action="store_true", help="Open a new instance of the app")
-    p_launch.add_argument("app_args", nargs=argparse.REMAINDER, help="Extra arguments passed to the app")
-    p_launch.set_defaults(func=cmd_launch)
-
     # env
     p_env = sub.add_parser("env", help="Print shell export/unset statements for current terminal")
     p_env.add_argument("--host", default=DEFAULT_LISTEN_HOST, help=f"Proxy host (default: {DEFAULT_LISTEN_HOST})")
     p_env.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT, help=f"Proxy port (default: {DEFAULT_LISTEN_PORT})")
-    p_env.add_argument("--gui-no-proxy", action="store_true", help="Include intranet/private CIDRs in NO_PROXY")
+    p_env.add_argument("--intranet-no-proxy", action="store_true", help="Include intranet/private CIDRs in NO_PROXY")
     p_env.add_argument("--unset", action="store_true", help="Print unset statements instead of export")
     p_env.set_defaults(func=cmd_env)
 
