@@ -22,7 +22,7 @@
 curl -fsSL https://raw.githubusercontent.com/vFrida/agent-proxy/main/install.sh | bash
 ```
 
-脚本会默认 `git clone` 到 `~/.agent-proxy` 并自动加入 Shell `PATH`。刷新终端（如 `source ~/.zshrc`）后即可直接运行：
+脚本会默认 `git clone` 到 `~/.agent-proxy` 并加入 Shell `PATH`（新终端自动生效；当前终端若仍找不到 `agent-proxy`，可按安装器输出的 rc 文件执行一次 `source`）。对已有安装重复执行时会拒绝覆盖未提交的本地改动，除非显式传入 `--force`。随后即可直接运行：
 
 ```bash
 agent-proxy list                  # 查看本机已检测到的工具与接管状态

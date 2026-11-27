@@ -22,7 +22,7 @@ It listens on `127.0.0.1:17890` by default (both `http://` and `socks5h://`); lo
 curl -fsSL https://raw.githubusercontent.com/vFrida/agent-proxy/main/install.sh | bash
 ```
 
-This clones `agent-proxy` into `~/.agent-proxy` and automatically adds it to your shell `PATH`. Reload your shell (e.g. `source ~/.zshrc`), then run:
+This clones `agent-proxy` into `~/.agent-proxy` and adds it to your shell `PATH` (new terminals pick it up automatically; for the current one, run `source` on the rc file printed by the installer if `agent-proxy` is still not found). Re-running the installer over an existing installation refuses to overwrite uncommitted changes unless you pass `--force`. Then run:
 
 ```bash
 agent-proxy list                  # Show detected tools and their wrap status

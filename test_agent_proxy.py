@@ -355,6 +355,59 @@ class TestAgentProxy(unittest.TestCase):
             )
             self.assertIn("agent-proxy", help_res.stdout)
 
+    def test_install_sh_refuses_to_clobber_local_changes(self) -> None:
+        repo_root = Path(__file__).resolve().parent
+        script = repo_root / "install.sh"
+        repo_url = f"file://{repo_root}"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            install_dir = tmp_path / ".agent-proxy"
+            base_args = [
+                "bash",
+                str(script),
+                "--repo-url",
+                repo_url,
+                "--dir",
+                str(install_dir),
+                "--no-path",
+            ]
+            subprocess.run(base_args, capture_output=True, text=True, check=True)
+
+            target = install_dir / "README.md"
+            target.write_text("local edit\n", encoding="utf-8")
+
+            blocked = subprocess.run(base_args, capture_output=True, text=True)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("Uncommitted changes", blocked.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), "local edit\n")
+
+            forced = subprocess.run(base_args + ["--force"], capture_output=True, text=True)
+            self.assertEqual(forced.returncode, 0)
+            self.assertNotEqual(target.read_text(encoding="utf-8"), "local edit\n")
+
+            # In-place init over a directory that already contains tracked files
+            inplace_dir = tmp_path / "inplace"
+            inplace_dir.mkdir()
+            custom = inplace_dir / "agent_proxy.py"
+            custom.write_text("# custom\n", encoding="utf-8")
+            inplace_args = [
+                "bash",
+                str(script),
+                "--repo-url",
+                repo_url,
+                "--dir",
+                str(inplace_dir),
+                "--no-path",
+            ]
+            inplace_blocked = subprocess.run(inplace_args, capture_output=True, text=True)
+            self.assertNotEqual(inplace_blocked.returncode, 0)
+            self.assertIn("would be overwritten", inplace_blocked.stderr)
+            self.assertEqual(custom.read_text(encoding="utf-8"), "# custom\n")
+
+            inplace_forced = subprocess.run(inplace_args + ["--force"], capture_output=True, text=True)
+            self.assertEqual(inplace_forced.returncode, 0)
+            self.assertNotEqual(custom.read_text(encoding="utf-8"), "# custom\n")
+
     def test_version_and_update(self) -> None:
         repo_root = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as tmp:

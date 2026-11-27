@@ -12,6 +12,7 @@ set -euo pipefail
 #   --shell <SHELL>      Shell for PATH setup: auto|zsh|bash|fish|sh
 #   --rc <PATH>          Explicit shell rc file for PATH setup
 #   --no-path            Skip adding install directory to PATH
+#   --force              Overwrite uncommitted tracked changes in an existing install
 #   -h, --help           Show this help message
 
 DEFAULT_REPO="${AGENT_PROXY_REPO:-vFrida/agent-proxy}"
@@ -35,6 +36,7 @@ Options:
   --shell <SHELL>      Shell type for PATH setup: auto|zsh|bash|fish|sh
   --rc <PATH>          Explicit shell rc file for PATH setup
   --no-path            Skip adding install directory to shell PATH
+  --force              Overwrite uncommitted tracked changes in an existing install
   -h, --help           Show this help message
 
 Environment variables:
@@ -88,12 +90,38 @@ is_dir_empty() {
   [ -z "$(ls -A "$dir" 2>/dev/null)" ]
 }
 
+# Refuse to force-checkout over local edits to tracked files.
+ensure_clean_checkout() {
+  local repo="$1"
+  local changes
+  changes="$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  if [ -n "$changes" ]; then
+    printf '%s\n' "$changes" >&2
+    err "Uncommitted changes in $repo; refusing to overwrite them. Commit or stash them, or re-run with --force."
+  fi
+}
+
+# Files tracked by FETCH_HEAD that already exist in the directory (in-place init case).
+conflicting_tracked_files() {
+  local repo="$1"
+  local path
+  git -C "$repo" ls-tree -r --name-only FETCH_HEAD 2>/dev/null | while IFS= read -r path; do
+    if [ -n "$path" ] && [ -e "$repo/$path" ]; then
+      printf '%s\n' "$path"
+    fi
+  done
+}
+
 sync_repo() {
   local repo_url="$1"
   local ref="$2"
   local install_dir="$3"
+  local force="$4"
 
-  if [ -d "$install_dir/.git" ]; then
+  if [ -e "$install_dir/.git" ]; then
+    if [ "$force" -eq 0 ]; then
+      ensure_clean_checkout "$install_dir"
+    fi
     log "Updating existing repository in $install_dir (${ref})..."
     git -C "$install_dir" remote set-url origin "$repo_url" 2>/dev/null || \
       git -C "$install_dir" remote add origin "$repo_url"
@@ -130,6 +158,14 @@ sync_repo() {
   git -C "$install_dir" remote set-url origin "$repo_url" 2>/dev/null || \
     git -C "$install_dir" remote add origin "$repo_url"
   git -C "$install_dir" fetch origin "$ref"
+  if [ "$force" -eq 0 ]; then
+    local conflicts
+    conflicts="$(conflicting_tracked_files "$install_dir")"
+    if [ -n "$conflicts" ]; then
+      printf '%s\n' "$conflicts" >&2
+      err "Existing files in $install_dir would be overwritten (listed above). Move them aside, or re-run with --force."
+    fi
+  fi
   git -C "$install_dir" checkout -f -B "$ref" FETCH_HEAD
 }
 
@@ -141,6 +177,7 @@ main() {
   local shell_type="auto"
   local rc_path=""
   local no_path=0
+  local force=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -178,6 +215,10 @@ main() {
         no_path=1
         shift
         ;;
+      --force)
+        force=1
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -193,7 +234,7 @@ main() {
   fi
 
   check_deps
-  sync_repo "$repo_url" "$ref" "$install_dir"
+  sync_repo "$repo_url" "$ref" "$install_dir" "$force"
 
   [ -f "$install_dir/agent-proxy" ] || err "Missing $install_dir/agent-proxy after clone"
   [ -f "$install_dir/agent_proxy.py" ] || err "Missing $install_dir/agent_proxy.py after clone"
