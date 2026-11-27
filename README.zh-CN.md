@@ -138,6 +138,8 @@ eval "$(./agent-proxy env)"         # 在当前终端会话临时导出代理环
 
 自测：`python3 -m unittest test_agent_proxy -v`
 
+颜色：终端（TTY）下自动启用彩色输出；可用 `AGENT_PROXY_COLOR=always|never|auto` 控制，`NO_COLOR=1` 也可关闭颜色。
+
 ---
 
 ## 常见问题
@@ -150,3 +152,5 @@ eval "$(./agent-proxy env)"         # 在当前终端会话临时导出代理环
 | 接管后当前会话仍未生效 | 旧进程环境已固定：`./agent-proxy wrap --restart` 或重启 IDE / Reload Window |
 | 端口被占用 | `lsof -nP -iTCP:17890`；或改用 `--port <新端口>` 启动并重新 `wrap --port <新端口>` |
 | 彻底卸载 | `./agent-proxy unwrap`（还原全部包装脚本） |
+| 包装后的 CLI 提示 “local proxy ... unavailable” | 用 `./agent-proxy status` 和 `~/.agent-proxy/proxy.log` 排查；CLI 仍会在无代理的情况下启动 |
+| 切换节点后流量仍走旧节点 | `./agent-proxy start -d` 检测到上游变化会自动重启守护进程 |

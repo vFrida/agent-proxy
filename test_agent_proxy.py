@@ -150,6 +150,25 @@ class TestAgentProxy(unittest.TestCase):
         self.assertEqual(hdr_v6[21], 0x03)
         self.assertEqual(hdr_v6[22:], ipaddress.IPv6Address("2001:4860:4860::8888").packed)
 
+    def test_parse_host_port(self) -> None:
+        self.assertEqual(mod._parse_host_port("example.com:8080", 80), ("example.com", 8080))
+        self.assertEqual(mod._parse_host_port("example.com", 443), ("example.com", 443))
+        self.assertEqual(mod._parse_host_port("[::1]:443", 80), ("::1", 443))
+        self.assertEqual(mod._parse_host_port("[::1]", 80), ("::1", 80))
+        self.assertEqual(mod._parse_host_port("::1", 80), ("::1", 80))
+        for bad in ("", "[::1", "[::1]x", "example.com:abc", "example.com:0", "example.com:70000", ":443"):
+            with self.assertRaises(ValueError, msg=f"expected ValueError for {bad!r}"):
+                mod._parse_host_port(bad, 80)
+
+    def test_dedupe_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a"
+            second = Path(tmp) / "b"
+            self.assertEqual(
+                mod._dedupe_paths([first, Path(str(first) + "/."), second, first]),
+                [first, second],
+            )
+
     def test_resolve_agent_names(self) -> None:
         self.assertEqual(mod._resolve_agent_names(None), ["agy", "claude", "codex", "cursor"])
         self.assertEqual(mod._resolve_agent_names(["antigravity", "claude-code", "codex", "cursor"]),
@@ -487,6 +506,45 @@ class TestAgentProxy(unittest.TestCase):
                 await w.drain()
                 reply = await r.read(1024)
                 self.assertEqual(reply, b"ECHO:PING_SOCKS5")
+                w.close()
+                await w.wait_closed()
+
+                # D. Malformed CONNECT port must yield a 400 response
+                r, w = await asyncio.open_connection("127.0.0.1", proxy.bound_port)
+                w.write(b"CONNECT fake.bad.test:notaport HTTP/1.1\r\nHost: fake.bad.test\r\n\r\n")
+                await w.drain()
+                head = await r.readuntil(b"\r\n\r\n")
+                self.assertIn(b"400 Bad Request", head)
+                w.close()
+                await w.wait_closed()
+
+                # E. Absolute https request without CONNECT must be rejected
+                r, w = await asyncio.open_connection("127.0.0.1", proxy.bound_port)
+                w.write(b"GET https://fake.https.test/ HTTP/1.1\r\nHost: fake.https.test\r\n\r\n")
+                await w.drain()
+                head = await r.readuntil(b"\r\n\r\n")
+                self.assertIn(b"400 Bad Request", head)
+                w.close()
+                await w.wait_closed()
+
+                # F. Missing Host header must yield a 400 response
+                r, w = await asyncio.open_connection("127.0.0.1", proxy.bound_port)
+                w.write(b"GET /hello HTTP/1.1\r\nProxy-Connection: keep-alive\r\n\r\n")
+                await w.drain()
+                head = await r.readuntil(b"\r\n\r\n")
+                self.assertIn(b"400 Bad Request", head)
+                w.close()
+                await w.wait_closed()
+
+                # G. Unsupported SOCKS5 command (BIND) must be rejected
+                r, w = await asyncio.open_connection("127.0.0.1", proxy.bound_port)
+                w.write(b"\x05\x01\x00")
+                await w.drain()
+                self.assertEqual(await r.readexactly(2), b"\x05\x00")
+                w.write(b"\x05\x02\x00\x01" + b"\x00" * 4 + struct.pack("!H", echo_port))
+                await w.drain()
+                socks_resp = await r.readexactly(10)
+                self.assertEqual(socks_resp[:2], b"\x05\x07")
                 w.close()
                 await w.wait_closed()
 

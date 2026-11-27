@@ -45,12 +45,30 @@ Environment variables:
 EOF
 }
 
+color_enabled() {
+  case "${AGENT_PROXY_COLOR:-}" in
+    always) return 0 ;;
+    never) return 1 ;;
+  esac
+  [ -z "${NO_COLOR:-}" ] || return 1
+  [ "${TERM:-}" != "dumb" ] || return 1
+  [ -t 1 ]
+}
+
 log() {
-  printf '[agent-proxy] %s\n' "$*"
+  if color_enabled; then
+    printf '\033[36m[agent-proxy]\033[0m %s\n' "$*"
+  else
+    printf '[agent-proxy] %s\n' "$*"
+  fi
 }
 
 err() {
-  printf '[agent-proxy] Error: %s\n' "$*" >&2
+  if color_enabled; then
+    printf '\033[31m[agent-proxy] Error:\033[0m %s\n' "$*" >&2
+  else
+    printf '[agent-proxy] Error: %s\n' "$*" >&2
+  fi
   exit 1
 }
 
@@ -181,7 +199,8 @@ main() {
   [ -f "$install_dir/agent_proxy.py" ] || err "Missing $install_dir/agent_proxy.py after clone"
   chmod 755 "$install_dir/agent-proxy" "$install_dir/agent_proxy.py"
 
-  python3 -m py_compile "$install_dir/agent_proxy.py" || err "Syntax verification failed for agent_proxy.py"
+  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' \
+    "$install_dir/agent_proxy.py" || err "Syntax verification failed for agent_proxy.py"
 
   log "Installed to: $install_dir ($("$install_dir/agent-proxy" version 2>/dev/null || echo 'version unknown'))"
 

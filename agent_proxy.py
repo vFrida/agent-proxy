@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import hashlib
 import ipaddress
 import json
 import logging
@@ -33,7 +34,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 17890
@@ -47,6 +48,76 @@ CONFIG_FILE = STATE_DIR / "config.json"
 WRAPPED_FILE = STATE_DIR / "wrapped.json"
 
 logger = logging.getLogger("agent_proxy")
+
+
+# ---------------------------------------------------------------------------
+# Terminal styling
+# ---------------------------------------------------------------------------
+
+
+class Style:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+
+
+def color_mode() -> str:
+    """Resolve color mode: explicit AGENT_PROXY_COLOR wins, then NO_COLOR/TERM."""
+    mode = os.environ.get("AGENT_PROXY_COLOR", "").strip().lower()
+    if mode in ("always", "never", "auto"):
+        return mode
+    if "NO_COLOR" in os.environ:
+        return "never"
+    if os.environ.get("TERM", "") == "dumb":
+        return "never"
+    return "auto"
+
+
+def use_color(stream: Optional[object] = None) -> bool:
+    mode = color_mode()
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    target = stream if stream is not None else sys.stdout
+    try:
+        return bool(target.isatty())  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
+
+def paint(text: str, *codes: str, stream: Optional[object] = None) -> str:
+    if not codes or not use_color(stream):
+        return text
+    return "".join(codes) + text + Style.RESET
+
+
+def ok(text: str) -> str:
+    return paint(text, Style.GREEN)
+
+
+def warn(text: str) -> str:
+    return paint(text, Style.YELLOW)
+
+
+def fail(text: str) -> str:
+    return paint(text, Style.RED)
+
+
+def note(text: str) -> str:
+    return paint(text, Style.DIM)
+
+
+def strong(text: str) -> str:
+    return paint(text, Style.BOLD)
+
+
+def value(text: str) -> str:
+    return paint(text, Style.CYAN)
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +162,16 @@ def parse_vless_uri(uri: str, force_insecure: bool = False) -> VlessNode:
     except ValueError as exc:
         raise ValueError(f"Invalid VLESS UUID: {parsed.username!r}") from exc
 
-    host = parsed.hostname
+    try:
+        host = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid VLESS URI authority: {exc}") from exc
     if not host:
         raise ValueError("VLESS URI is missing server hostname")
-    port = parsed.port or 443
+    port = explicit_port or 443
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Invalid VLESS port: {port}")
 
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
@@ -239,7 +316,7 @@ def _install_ssl_shutdown_filter(loop: asyncio.AbstractEventLoop) -> None:
     """Suppress harmless CPython 3.9 SSLProtocol close_notify race on shutdown."""
     default_handler = loop.default_exception_handler
 
-    def handler(ev_loop: asyncio.AbstractEventLoop, context: Dict[str, object]) -> None:
+    def handler(ev_loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
         msg = str(context.get("message", ""))
         exc = context.get("exception")
         if "Fatal error on SSL transport" in msg and isinstance(exc, (OSError, RuntimeError)):
@@ -252,6 +329,24 @@ def _install_ssl_shutdown_filter(loop: asyncio.AbstractEventLoop) -> None:
 # ---------------------------------------------------------------------------
 # Local Mixed HTTP / HTTPS CONNECT / SOCKS5 Proxy Server
 # ---------------------------------------------------------------------------
+
+
+SOCKS5_REPLY_SUCCESS = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+SOCKS5_REPLY_GENERAL_FAILURE = b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00"
+SOCKS5_REPLY_COMMAND_UNSUPPORTED = b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00"
+SOCKS5_REPLY_ADDRESS_UNSUPPORTED = b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00"
+
+
+async def _reply_http_status(writer: asyncio.StreamWriter, status_line: str, message: str = "") -> None:
+    body = (message + "\n").encode("utf-8") if message else b""
+    headers = [
+        f"HTTP/1.1 {status_line}",
+        "Content-Type: text/plain; charset=utf-8",
+        f"Content-Length: {len(body)}",
+        "Connection: close",
+    ]
+    writer.write(("\r\n".join(headers) + "\r\n\r\n").encode("latin-1") + body)
+    await writer.drain()
 
 
 class VlessLocalProxyServer:
@@ -269,13 +364,13 @@ class VlessLocalProxyServer:
         self.connect_timeout = connect_timeout
         self.ssl_ctx = create_tls_context(node, cafile=cafile)
         self._server: Optional[asyncio.AbstractServer] = None
-        self._active_conns = 0
         self._client_tasks: Set[asyncio.Task] = set()
 
     @property
     def bound_port(self) -> int:
-        if self._server and self._server.sockets:
-            return int(self._server.sockets[0].getsockname()[1])
+        sockets = getattr(self._server, "sockets", None) if self._server else None
+        if sockets:
+            return int(sockets[0].getsockname()[1])
         return self.listen_port
 
     async def start(self) -> None:
@@ -343,7 +438,7 @@ class VlessLocalProxyServer:
                 await writer.drain()
             return reader, writer, False
 
-        connect_kwargs: Dict[str, object] = {}
+        connect_kwargs: Dict[str, Any] = {}
         if self.ssl_ctx is not None:
             connect_kwargs["ssl"] = self.ssl_ctx
             connect_kwargs["server_hostname"] = self.node.tls_server_name
@@ -373,7 +468,7 @@ class VlessLocalProxyServer:
                 await remote_writer.drain()
             if remote_writer.can_write_eof():
                 remote_writer.write_eof()
-        except (asyncio.CancelledError, ConnectionError, BrokenPipeError, OSError):
+        except (asyncio.CancelledError, OSError):
             pass
 
     async def _pipe_remote_to_client(
@@ -399,7 +494,9 @@ class VlessLocalProxyServer:
                 await client_writer.drain()
             if client_writer.can_write_eof():
                 client_writer.write_eof()
-        except (asyncio.CancelledError, asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, OSError):
+        except (asyncio.CancelledError, OSError):
+            pass
+        except asyncio.IncompleteReadError:
             pass
         except Exception as exc:
             logger.debug("Upstream read error: %s", exc)
@@ -429,7 +526,6 @@ class VlessLocalProxyServer:
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
-        self._active_conns += 1
         _tune_socket(client_writer)
         remote_writer: Optional[asyncio.StreamWriter] = None
         try:
@@ -445,7 +541,6 @@ class VlessLocalProxyServer:
         except Exception as exc:
             logger.debug("Connection error: %s", exc)
         finally:
-            self._active_conns -= 1
             await _close_writer(remote_writer)
             await _close_writer(client_writer)
 
@@ -458,7 +553,7 @@ class VlessLocalProxyServer:
         nmethods_b = await client_reader.readexactly(1)
         nmethods = nmethods_b[0]
         methods = await client_reader.readexactly(nmethods)
-        if 0x00 not in methods:
+        if not methods or 0x00 not in methods:
             client_writer.write(b"\x05\xff")
             await client_writer.drain()
             return None
@@ -472,7 +567,7 @@ class VlessLocalProxyServer:
         if ver != 0x05:
             return None
         if cmd != 0x01:  # Only TCP CONNECT supported
-            client_writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+            client_writer.write(SOCKS5_REPLY_COMMAND_UNSUPPORTED)
             await client_writer.drain()
             return None
 
@@ -480,11 +575,15 @@ class VlessLocalProxyServer:
             target_host = socket.inet_ntop(socket.AF_INET, await client_reader.readexactly(4))
         elif atyp == 0x03:  # Domain
             dlen = (await client_reader.readexactly(1))[0]
+            if dlen == 0:
+                client_writer.write(SOCKS5_REPLY_ADDRESS_UNSUPPORTED)
+                await client_writer.drain()
+                return None
             target_host = (await client_reader.readexactly(dlen)).decode("utf-8", errors="replace")
         elif atyp == 0x04:  # IPv6
             target_host = socket.inet_ntop(socket.AF_INET6, await client_reader.readexactly(16))
         else:
-            client_writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+            client_writer.write(SOCKS5_REPLY_ADDRESS_UNSUPPORTED)
             await client_writer.drain()
             return None
 
@@ -495,12 +594,12 @@ class VlessLocalProxyServer:
             remote_reader, remote_writer, is_vless = await self._open_upstream(target_host, target_port)
         except Exception as exc:
             logger.warning("SOCKS5 upstream failed for %s:%d: %s", target_host, target_port, exc)
-            client_writer.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+            client_writer.write(SOCKS5_REPLY_GENERAL_FAILURE)
             await client_writer.drain()
             return None
 
         # Reply SUCCEEDED immediately (VLESS response header arrives lazily after client sends payload)
-        client_writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        client_writer.write(SOCKS5_REPLY_SUCCESS)
         await client_writer.drain()
 
         await self._relay(client_reader, client_writer, remote_reader, remote_writer, is_vless)
@@ -514,7 +613,13 @@ class VlessLocalProxyServer:
     ) -> Optional[asyncio.StreamWriter]:
         try:
             rest_head = await asyncio.wait_for(client_reader.readuntil(b"\r\n\r\n"), timeout=30.0)
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        except asyncio.TimeoutError:
+            await _reply_http_status(client_writer, "408 Request Timeout", "Timed out reading request headers.")
+            return None
+        except asyncio.LimitOverrunError:
+            await _reply_http_status(client_writer, "431 Request Header Fields Too Large")
+            return None
+        except asyncio.IncompleteReadError:
             return None
 
         raw_header = first_byte + rest_head
@@ -525,22 +630,24 @@ class VlessLocalProxyServer:
 
         parts = lines[0].split(" ")
         if len(parts) < 3:
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            await client_writer.drain()
+            await _reply_http_status(client_writer, "400 Bad Request", "Malformed HTTP request line.")
             return None
 
         method, target, http_version = parts[0].upper(), parts[1], parts[2]
         header_lines = [line for line in lines[1:] if line]
 
         if method == "CONNECT":
-            target_host, target_port = _parse_host_port(target, default_port=443)
+            try:
+                target_host, target_port = _parse_host_port(target, default_port=443)
+            except ValueError as exc:
+                await _reply_http_status(client_writer, "400 Bad Request", str(exc))
+                return None
             logger.debug("HTTP CONNECT %s:%d", target_host, target_port)
             try:
                 remote_reader, remote_writer, is_vless = await self._open_upstream(target_host, target_port)
             except Exception as exc:
                 logger.warning("HTTP CONNECT upstream failed for %s:%d: %s", target_host, target_port, exc)
-                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                await client_writer.drain()
+                await _reply_http_status(client_writer, "502 Bad Gateway", "Upstream connection failed.")
                 return None
 
             client_writer.write(f"{http_version} 200 Connection Established\r\n\r\n".encode("latin-1"))
@@ -550,10 +657,17 @@ class VlessLocalProxyServer:
             return remote_writer
 
         # Plain HTTP request forwarding
-        if target.startswith(("http://", "https://")):
+        if target.startswith("https://"):
+            await _reply_http_status(
+                client_writer,
+                "400 Bad Request",
+                "Absolute https:// requests are not supported; use CONNECT instead.",
+            )
+            return None
+        if target.startswith("http://"):
             parsed_url = urllib.parse.urlsplit(target)
             target_host = parsed_url.hostname or ""
-            target_port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+            target_port = parsed_url.port or 80
             path = parsed_url.path or "/"
             if parsed_url.query:
                 path = f"{path}?{parsed_url.query}"
@@ -564,15 +678,17 @@ class VlessLocalProxyServer:
                     host_header = line.split(":", 1)[1].strip()
                     break
             if not host_header:
-                client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                await client_writer.drain()
+                await _reply_http_status(client_writer, "400 Bad Request", "Missing Host header.")
                 return None
-            target_host, target_port = _parse_host_port(host_header, default_port=80)
+            try:
+                target_host, target_port = _parse_host_port(host_header, default_port=80)
+            except ValueError as exc:
+                await _reply_http_status(client_writer, "400 Bad Request", str(exc))
+                return None
             path = target
 
         if not target_host:
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            await client_writer.drain()
+            await _reply_http_status(client_writer, "400 Bad Request", "Missing target host.")
             return None
 
         logger.debug("HTTP %s %s:%d%s", method, target_host, target_port, path)
@@ -600,8 +716,7 @@ class VlessLocalProxyServer:
             )
         except Exception as exc:
             logger.warning("HTTP upstream failed for %s:%d: %s", target_host, target_port, exc)
-            client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            await client_writer.drain()
+            await _reply_http_status(client_writer, "502 Bad Gateway", "Upstream connection failed.")
             return None
 
         await self._relay(client_reader, client_writer, remote_reader, remote_writer, is_vless)
@@ -609,20 +724,38 @@ class VlessLocalProxyServer:
 
 
 def _parse_host_port(authority: str, default_port: int) -> Tuple[str, int]:
+    """Parse `host[:port]` or `[ipv6][:port]`; raise ValueError on malformed input."""
     authority = authority.strip()
+    if not authority:
+        raise ValueError("Empty host authority")
     if authority.startswith("["):
         end_bracket = authority.find("]")
         if end_bracket == -1:
-            raise ValueError(f"Malformed IPv6 authority: {authority}")
+            raise ValueError(f"Malformed IPv6 authority: {authority!r}")
         host = authority[1:end_bracket]
         rest = authority[end_bracket + 1 :]
-        if rest.startswith(":"):
-            return host, int(rest[1:])
-        return host, default_port
-    if ":" in authority:
+        if rest and not rest.startswith(":"):
+            raise ValueError(f"Malformed authority: {authority!r}")
+        port_str = rest[1:] if rest else ""
+    elif authority.count(":") > 1:
+        # Bare IPv6 address without brackets and without a port
+        return authority, default_port
+    elif ":" in authority:
         host, port_str = authority.rsplit(":", 1)
-        return host, int(port_str)
-    return authority, default_port
+    else:
+        return authority, default_port
+
+    if not host:
+        raise ValueError(f"Missing host in authority: {authority!r}")
+    if not port_str:
+        return host, default_port
+    try:
+        port = int(port_str)
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in authority {authority!r}: {port_str!r}") from exc
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Port out of range in authority {authority!r}: {port}")
+    return host, port
 
 
 # ---------------------------------------------------------------------------
@@ -645,23 +778,25 @@ def load_saved_uri() -> Optional[str]:
 
 
 def prompt_upstream_uri(force_insecure: bool = False, save: bool = True) -> str:
-    print("No upstream proxy node configured. Enter a VLESS URI (format: vless://<uuid>@<host>:<port>?...)")
+    print(warn("No upstream proxy node configured."))
+    print("Enter a VLESS URI, for example:")
+    print("  " + value("vless://<uuid>@<host>:<port>?security=tls&type=tcp#remark"))
     while True:
         try:
-            entered = input("Enter proxy node URI: ").strip()
+            entered = input(strong("Enter proxy node URI: ")).strip()
         except (EOFError, KeyboardInterrupt) as exc:
             raise ValueError("Cancelled entering proxy node URI.") from exc
         if not entered:
-            print("Proxy node URI cannot be empty; please try again.", file=sys.stderr)
+            print(fail("Proxy node URI cannot be empty; please try again."), file=sys.stderr)
             continue
         try:
             parse_vless_uri(entered, force_insecure=force_insecure)
         except ValueError as exc:
-            print(f"Invalid node URI: {exc}. Please try again.", file=sys.stderr)
+            print(fail(f"Invalid node URI: {exc}. Please try again."), file=sys.stderr)
             continue
         if save:
             save_default_uri(entered)
-            print(f"Saved node config to: {CONFIG_FILE}")
+            print_saved_config()
         return entered
 
 
@@ -695,9 +830,37 @@ def resolve_upstream_uri(
 resolve_vless_uri = resolve_upstream_uri
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write content to path atomically (temp file + rename) to avoid corruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_json(path: Path, data: object) -> None:
+    _atomic_write_text(path, json.dumps(data, indent=2) + "\n")
+
+
 def save_default_uri(uri: str) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps({"upstream_uri": uri}, indent=2) + "\n", encoding="utf-8")
+    _write_json(CONFIG_FILE, {"upstream_uri": uri})
+
+
+def print_saved_config() -> None:
+    print(ok("Saved node config: ") + value(str(CONFIG_FILE)))
+
+
+def _as_int(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 def _pid_alive(pid: int) -> bool:
@@ -712,7 +875,7 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
-def read_running_state() -> Optional[Dict[str, object]]:
+def read_running_state() -> Optional[Dict[str, Any]]:
     if not PID_FILE.exists():
         return None
     try:
@@ -721,7 +884,7 @@ def read_running_state() -> Optional[Dict[str, object]]:
         return None
     if not _pid_alive(pid):
         return None
-    state: Dict[str, object] = {"pid": pid}
+    state: Dict[str, Any] = {"pid": pid}
     if STATE_FILE.exists():
         try:
             state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
@@ -730,22 +893,23 @@ def read_running_state() -> Optional[Dict[str, object]]:
     return state
 
 
+def upstream_identity(uri: str) -> str:
+    """Short, non-reversible fingerprint used to detect node changes."""
+    return hashlib.sha256(uri.strip().encode("utf-8")).hexdigest()[:12]
+
+
 def write_running_state(pid: int, host: str, port: int, node: VlessNode) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(f"{pid}\n", encoding="utf-8")
-    STATE_FILE.write_text(
-        json.dumps(
-            {
-                "pid": pid,
-                "listen_host": host,
-                "listen_port": port,
-                "node": node.display_label(),
-                "started_at": int(time.time()),
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _atomic_write_text(PID_FILE, f"{pid}\n")
+    _write_json(
+        STATE_FILE,
+        {
+            "pid": pid,
+            "listen_host": host,
+            "listen_port": port,
+            "node": node.display_label(),
+            "upstream_id": upstream_identity(node.raw_uri),
+            "started_at": int(time.time()),
+        },
     )
 
 
@@ -758,26 +922,31 @@ def clear_running_state() -> None:
 
 
 def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
+    """Poll a TCP port until it accepts connections or the timeout expires."""
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         try:
             with socket.create_connection((host, port), timeout=0.5):
                 return True
         except OSError:
-            time.sleep(0.1)
-    return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
 
-def start_daemon(uri: str, host: str, port: int, insecure: bool, verbose: bool) -> Dict[str, object]:
+def start_daemon(uri: str, host: str, port: int, insecure: bool, verbose: bool) -> Dict[str, Any]:
     existing = read_running_state()
     if existing:
-        if (
+        same_endpoint = (
             existing.get("listen_host") == host
-            and int(existing.get("listen_port", -1)) == port
+            and _as_int(existing.get("listen_port"), -1) == port
             and _wait_for_port(host, port, timeout=0.5)
-        ):
+        )
+        known_identity = existing.get("upstream_id")
+        same_upstream = known_identity is None or known_identity == upstream_identity(uri)
+        if same_endpoint and same_upstream:
             return existing
-        # Stale or different port; stop previous daemon first
+        # Endpoint or upstream node changed; stop the previous daemon first.
         stop_daemon()
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -807,10 +976,21 @@ def start_daemon(uri: str, host: str, port: int, insecure: bool, verbose: bool) 
         )
 
     if not _wait_for_port(host, port, timeout=5.0):
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         tail = ""
         if LOG_FILE.exists():
-            tail = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1000:]
-        raise RuntimeError(f"Proxy daemon failed to start on {host}:{port}.\nLog tail:\n{tail}")
+            tail = LOG_FILE.read_text(encoding="utf-8", errors="replace")[-1000:].strip()
+        detail = f"\nLog tail:\n{tail}" if tail else ""
+        raise RuntimeError(
+            f"Proxy daemon failed to start on {host}:{port}. See {LOG_FILE} for details.{detail}"
+        )
 
     state = read_running_state()
     if state:
@@ -840,6 +1020,9 @@ def stop_daemon() -> bool:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    kill_deadline = time.monotonic() + 2.0
+    while time.monotonic() < kill_deadline and _pid_alive(pid):
+        time.sleep(0.05)
     clear_running_state()
     return True
 
@@ -849,11 +1032,31 @@ def stop_daemon() -> bool:
 # ---------------------------------------------------------------------------
 
 
+class _ColorLogFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG: Style.DIM,
+        logging.INFO: Style.GREEN,
+        logging.WARNING: Style.YELLOW,
+        logging.ERROR: Style.RED,
+        logging.CRITICAL: Style.RED,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        code = self.LEVEL_COLORS.get(record.levelno)
+        return paint(message, code, stream=sys.stderr) if code else message
+
+
 def _setup_logging(verbose: bool) -> None:
+    handler = logging.StreamHandler(sys.stderr)
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
+    if use_color(sys.stderr):
+        handler.setFormatter(_ColorLogFormatter(fmt, datefmt="%H:%M:%S"))
+    else:
+        handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
+        handlers=[handler],
     )
 
 
@@ -878,6 +1081,13 @@ async def _run_server_foreground(node: VlessNode, host: str, port: int) -> None:
         clear_running_state()
 
 
+def print_proxy_details(host: str, port: int, upstream: str) -> None:
+    print(f"  {strong('HTTP/HTTPS')} : {value(f'http://{host}:{port}')}")
+    print(f"  {strong('SOCKS5')}     : {value(f'socks5h://{host}:{port}')}")
+    print(f"  {strong('Upstream')}   : {upstream}")
+    print(f"  {strong('Log file')}   : {note(str(LOG_FILE))}")
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     uri = resolve_upstream_uri(
         args.uri,
@@ -891,11 +1101,9 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     if args.daemon:
         state = start_daemon(uri, args.host, args.port, args.insecure, args.verbose)
-        print(f"Proxy started in background (PID {state['pid']})")
-        print(f"  HTTP/HTTPS : http://{args.host}:{args.port}")
-        print(f"  SOCKS5     : socks5h://{args.host}:{args.port}")
-        print(f"  Upstream   : {node.display_label()}")
-        print(f"  Log file   : {LOG_FILE}")
+        print(ok(f"Proxy started in background (PID {state['pid']})."))
+        print_proxy_details(args.host, args.port, node.display_label())
+        print(note(f"Tip: run `agent-proxy wrap` to make coding agents use this proxy automatically."))
         return 0
 
     _setup_logging(args.verbose)
@@ -909,30 +1117,31 @@ def cmd_start(args: argparse.Namespace) -> int:
 def cmd_stop(_args: argparse.Namespace) -> int:
     stopped = stop_daemon()
     if stopped:
-        print("Proxy daemon stopped.")
+        print(ok("Proxy daemon stopped."))
     else:
-        print("Proxy daemon is not running.")
+        print(note("Proxy daemon is not running."))
     return 0
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
     state = read_running_state()
     if not state:
-        print("Status: STOPPED")
+        print(f"{strong('Status')}: {fail('STOPPED')}")
         try:
             configured = resolve_upstream_uri(None)
-            print(f"Default upstream: {parse_vless_uri(configured).display_label()}")
+            print(f"{strong('Default upstream')}: {parse_vless_uri(configured).display_label()}")
         except ValueError:
-            print("Default upstream: (not configured; run `agent-proxy start -d` to enter a node URI)")
+            print(f"{strong('Default upstream')}: {note('(not configured)')}")
+            print(note("Configure it with: agent-proxy start -d --save --uri 'vless://...'"))
+        else:
+            print(note("Start it with: agent-proxy start -d"))
         return 1
-    host = state.get("listen_host", DEFAULT_LISTEN_HOST)
-    port = state.get("listen_port", DEFAULT_LISTEN_PORT)
-    reachable = _wait_for_port(str(host), int(port), timeout=0.5)
-    print(f"Status     : {'RUNNING' if reachable else 'STARTING/UNREACHABLE'} (PID {state['pid']})")
-    print(f"HTTP/HTTPS : http://{host}:{port}")
-    print(f"SOCKS5     : socks5h://{host}:{port}")
-    print(f"Upstream   : {state.get('node', 'unknown')}")
-    print(f"Log file   : {LOG_FILE}")
+    host = str(state.get("listen_host") or DEFAULT_LISTEN_HOST)
+    port = _as_int(state.get("listen_port"), DEFAULT_LISTEN_PORT)
+    reachable = _wait_for_port(host, port, timeout=0.5)
+    status_text = ok("RUNNING") if reachable else warn("STARTING/UNREACHABLE")
+    print(f"{strong('Status')}     : {status_text} (PID {state['pid']})")
+    print_proxy_details(host, port, str(state.get("node", "unknown")))
     return 0
 
 
@@ -1049,6 +1258,18 @@ def _resolve_agent_names(names: Optional[Sequence[str]]) -> List[str]:
     return resolved
 
 
+def _dedupe_paths(paths: Iterable[Path]) -> List[Path]:
+    """Expand user dirs, normalize to absolute paths and drop duplicates."""
+    result: List[Path] = []
+    seen: Set[str] = set()
+    for path in paths:
+        norm = os.path.abspath(os.path.expanduser(str(path)))
+        if norm not in seen:
+            seen.add(norm)
+            result.append(Path(norm))
+    return result
+
+
 def _path_exists_entry(path: Path) -> bool:
     try:
         return (path.is_symlink() or path.exists()) and not path.is_dir()
@@ -1118,8 +1339,7 @@ def _load_wrapped_registry() -> List[str]:
 
 def _save_wrapped_registry(paths: Iterable[str]) -> None:
     unique = sorted({os.path.abspath(p) for p in paths})
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    WRAPPED_FILE.write_text(json.dumps({"wrapped": unique}, indent=2) + "\n", encoding="utf-8")
+    _write_json(WRAPPED_FILE, {"wrapped": unique})
 
 
 def _record_wrapped_path(target: Path) -> None:
@@ -1152,22 +1372,35 @@ def _proxy_env(host: str, port: int, no_proxy: Optional[str] = None) -> Dict[str
 
 
 def _wrapper_script(bin_name: str, host: str, port: int) -> str:
-    app = Path(__file__).resolve()
-    py = sys.executable or "/usr/bin/python3"
+    """Render the POSIX sh wrapper that injects proxy env vars before exec'ing the real CLI."""
+    app = _escape_double_quoted(str(Path(__file__).resolve()))
+    py = _escape_double_quoted(sys.executable or "/usr/bin/python3")
+    name = _escape_double_quoted(bin_name)
+    host_q = _escape_double_quoted(host)
+    port_q = _escape_double_quoted(str(port))
     return f'''#!/bin/sh
 {WRAPPER_MARKER}
 # Generated by `agent-proxy wrap`: injects local proxy env vars before launching `{bin_name}`.
-# Uninstall: `agent-proxy unwrap` (restores {bin_name}.real back to {bin_name}).
+# Restore the original binary with: agent-proxy unwrap
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BIN_DIR="$SELF_DIR"
-BIN_NAME="{bin_name}"
+BIN_NAME="{name}"
 PY="{py}"
 APP="{app}"
-HOST="{host}"
-PORT="{port}"
+HOST="{host_q}"
+PORT="{port_q}"
 PROXY="http://$HOST:$PORT"
 
-# 1) Locate the real entry point: original file/symlink renamed to ${{BIN_NAME}}.real during wrap
+port_open() {{
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 1 "$HOST" "$PORT" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  "$PY" -c 'import socket,sys;s=socket.socket();s.settimeout(1);sys.exit(0 if s.connect_ex((sys.argv[1],int(sys.argv[2])))==0 else 1)' \
+    "$HOST" "$PORT" >/dev/null 2>&1
+}}
+
+# 1) Locate the real entry point: the original file/symlink, renamed to ${{BIN_NAME}}.real on wrap.
 if [ -x "$BIN_DIR/${{BIN_NAME}}.real" ] || [ -L "$BIN_DIR/${{BIN_NAME}}.real" ]; then
   REAL="$BIN_DIR/${{BIN_NAME}}.real"
 else
@@ -1181,28 +1414,34 @@ else
   IFS=$OLD_IFS
 fi
 if [ -z "$REAL" ]; then
-  echo "agent-proxy: could not find real $BIN_NAME (expected $BIN_DIR/${{BIN_NAME}}.real)" >&2
+  echo "agent-proxy: could not find the real $BIN_NAME binary (expected $BIN_DIR/${{BIN_NAME}}.real)." >&2
+  echo "agent-proxy: run 'agent-proxy wrap' again to repair the wrapper, or 'agent-proxy unwrap' to restore." >&2
   exit 127
 fi
 
-# 2) Start the local proxy daemon if it is not listening yet (wait up to 5s)
-if ! nc -z -w 1 "$HOST" "$PORT" >/dev/null 2>&1; then
+# 2) Start the local proxy daemon if it is not listening yet (wait up to ~5s).
+if ! port_open; then
   "$PY" "$APP" start -d --host "$HOST" --port "$PORT" >/dev/null 2>&1 &
   i=0
-  while [ $i -lt 50 ]; do
-    nc -z -w 1 "$HOST" "$PORT" >/dev/null 2>&1 && break
+  while [ "$i" -lt 50 ]; do
+    port_open && break
     i=$((i + 1))
     sleep 0.1
   done
 fi
 
-# 3) Inject proxy env vars (compatible with Go/Node/Python/Rust CLIs)
-export HTTP_PROXY="$PROXY"  HTTPS_PROXY="$PROXY"
-export http_proxy="$PROXY"  https_proxy="$PROXY"
-export ALL_PROXY="socks5h://$HOST:$PORT"  all_proxy="socks5h://$HOST:$PORT"
-export NO_PROXY="${{NO_PROXY:-{DEFAULT_NO_PROXY}}}"
-export no_proxy="${{no_proxy:-{DEFAULT_NO_PROXY}}}"
-export NODE_USE_ENV_PROXY=1
+# 3) Inject proxy env vars (compatible with Go/Node/Python/Rust CLIs). If the proxy
+#    is still unavailable, keep going without it so the CLI itself still works.
+if port_open; then
+  export HTTP_PROXY="$PROXY"  HTTPS_PROXY="$PROXY"
+  export http_proxy="$PROXY"  https_proxy="$PROXY"
+  export ALL_PROXY="socks5h://$HOST:$PORT"  all_proxy="socks5h://$HOST:$PORT"
+  export NO_PROXY="${{NO_PROXY:-{DEFAULT_NO_PROXY}}}"
+  export no_proxy="${{no_proxy:-{DEFAULT_NO_PROXY}}}"
+  export NODE_USE_ENV_PROXY=1
+else
+  echo "agent-proxy: warning: local proxy $HOST:$PORT is unavailable; starting $BIN_NAME without proxy." >&2
+fi
 
 exec "$REAL" "$@"
 '''
@@ -1216,11 +1455,11 @@ def _wrap_one(target: Path, host: str, port: int) -> bool:
         if real.is_symlink() or real.exists():
             real.unlink()
         os.replace(target, real)
-        print(f"  Preserved original binary: {target} -> {real.name}")
+        print(f"  {note('Preserved original binary:')} {target} -> {real.name}")
     target.write_text(_wrapper_script(target.name, host, port), encoding="utf-8")
     os.chmod(target, 0o755)
     _record_wrapped_path(target)
-    print(f"  Wrapped: {target}")
+    print(f"  {ok('Wrapped:')} {target}")
     return True
 
 
@@ -1229,7 +1468,7 @@ def _unwrap_one(target: Path) -> bool:
     if _is_our_wrapper(target) and (real.is_symlink() or real.exists()):
         os.replace(real, target)
         _forget_wrapped_path(target)
-        print(f"  Restored: {target}")
+        print(f"  {ok('Restored:')} {target}")
         return True
     return False
 
@@ -1268,16 +1507,16 @@ def _running_agent_pids(process_names: Iterable[str]) -> List[int]:
 def _restart_agent_processes(process_names: Iterable[str], timeout: float = 5.0) -> int:
     pids = _running_agent_pids(process_names)
     if not pids:
-        print("  No running target processes need to be restarted.")
+        print(note("  No running target processes need to be restarted."))
         return 0
-    print(f"  Restarting processes: {pids}")
+    print(f"  {strong('Restarting processes:')} {pids}")
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         except PermissionError:
-            print(f"  Skipped process {pid} (permission denied)")
+            print(warn(f"  Skipped process {pid} (permission denied)"))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not any(_pid_alive(p) for p in pids):
@@ -1289,7 +1528,7 @@ def _restart_agent_processes(process_names: Iterable[str], timeout: float = 5.0)
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-    print("  Stopped old processes; the next invocation or IDE session will automatically use the proxy.")
+    print(ok("  Stopped old processes; the next invocation or IDE session will automatically use the proxy."))
     return 0
 
 
@@ -1307,33 +1546,42 @@ def _ensure_proxy_running(host: str, port: int, uri: Optional[str] = None, insec
 
 
 def cmd_list(_args: argparse.Namespace) -> int:
-    print("Supported Coding Agents:")
+    print(strong("Supported Coding Agents:"))
+    discovered = {name: _discover_profile_bins(profile) for name, profile in AGENT_PROFILES.items()}
+    wrapped_count = 0
     for name, profile in AGENT_PROFILES.items():
-        bins = _discover_profile_bins(profile)
+        bins = discovered[name]
         if bins:
             parts = []
             for b in bins:
-                tag = "WRAPPED" if _is_our_wrapper(b) else "UNWRAPPED"
+                is_wrapped = _is_our_wrapper(b)
+                wrapped_count += 1 if is_wrapped else 0
+                tag = ok("WRAPPED") if is_wrapped else warn("UNWRAPPED")
                 parts.append(f"{b} [{tag}]")
             bin_info = ", ".join(parts)
         else:
-            bin_info = "CLI not detected"
+            bin_info = note("CLI not detected")
         print(f"  - {name:<8} {profile.display_name:<28} {bin_info}")
 
     known_paths = {
         os.path.abspath(str(p))
-        for profile in AGENT_PROFILES.values()
-        for p in _discover_profile_bins(profile)
+        for bins in discovered.values()
+        for p in bins
     }
     custom_wrapped = [
         Path(p) for p in _load_wrapped_registry()
         if os.path.abspath(p) not in known_paths and _is_our_wrapper(Path(p))
     ]
     if custom_wrapped:
-        print("\nOther custom wrapped paths:")
+        print("\n" + strong("Other custom wrapped paths:"))
         for p in custom_wrapped:
-            print(f"  - {p} [WRAPPED]")
-    print("\nYou can also run any command without wrapping: agent-proxy run <cmd> [args...]")
+            print(f"  - {p} [{ok('WRAPPED')}]")
+    print(
+        "\n"
+        + note("You can also run any command without wrapping: agent-proxy run <cmd> [args...]")
+    )
+    if wrapped_count == 0:
+        print(note("Nothing is wrapped yet. Run `agent-proxy wrap` to route agent traffic through the proxy."))
     return 0
 
 
@@ -1342,7 +1590,7 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         uri = args.uri.strip()
         parse_vless_uri(uri)
         save_default_uri(uri)
-        print(f"Saved node config to: {CONFIG_FILE}")
+        print_saved_config()
     else:
         try:
             resolve_upstream_uri(None)
@@ -1353,36 +1601,28 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 raise
 
     selected_names = _resolve_agent_names(args.agents)
-    targets: List[Path] = []
-    seen: Set[str] = set()
-
-    def add_target(p: Path) -> None:
-        norm = os.path.abspath(str(p))
-        if norm not in seen:
-            seen.add(norm)
-            targets.append(Path(norm))
-
-    for b in (args.bin or []):
-        add_target(Path(os.path.expanduser(b)))
-
     include_profiles = not args.bin or bool(args.agents)
+
+    raw_targets: List[Path] = [Path(b) for b in (args.bin or [])]
     if include_profiles:
         for name in selected_names:
-            for p in _discover_profile_bins(AGENT_PROFILES[name]):
-                add_target(p)
+            raw_targets.extend(_discover_profile_bins(AGENT_PROFILES[name]))
 
+    targets = _dedupe_paths(raw_targets)
     wrapped = [t for t in targets if _wrap_one(t, args.host, args.port)]
 
     if not wrapped:
         names_str = ", ".join(selected_names) if include_profiles else ", ".join(args.bin or [])
         print(
-            f"Error: no wrappable CLI detected (targets: {names_str}). "
-            "Use `--bin /path/to/cmd` to specify a path, or run `agent-proxy run <cmd>` directly.",
+            fail(
+                f"Error: no wrappable CLI detected (targets: {names_str}). "
+                "Use `--bin /path/to/cmd` to specify a path, or run `agent-proxy run <cmd>` directly."
+            ),
             file=sys.stderr,
         )
         return 1
 
-    print(f"Proxy: http://{args.host}:{args.port} (auto-starts when not running)")
+    print(f"{strong('Proxy')}: {value(f'http://{args.host}:{args.port}')} {note('(auto-starts when not running)')}")
 
     proc_names: Set[str] = set()
     if include_profiles:
@@ -1396,40 +1636,29 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     if args.restart:
         _restart_agent_processes(proc_names)
     elif running:
-        print(f"Note: detected {len(running)} running target process(es) (PID {', '.join(map(str, running))}).")
-        print("      Existing processes have a fixed environment and must be restarted to take effect:")
-        print("        agent-proxy wrap --restart")
-        print("      Or run Reload Window / reopen the session in your IDE.")
+        print(warn(f"Note: detected {len(running)} running target process(es) (PID {', '.join(map(str, running))})."))
+        print(note("      Running processes keep their old environment; restart them to pick up the proxy:"))
+        print(f"        {value('agent-proxy wrap --restart')}")
+        print(note("      Or reload the window / reopen the session in your IDE."))
 
+    print(ok(f"Wrapped {len(wrapped)} CLI(s).") + note(" The proxy starts automatically on next use."))
     return 0
 
 
 def cmd_unwrap(args: argparse.Namespace) -> int:
     unwrap_all = not args.agents and not args.bin
     selected_names = _resolve_agent_names(args.agents) if args.agents else list(AGENT_PROFILES.keys())
-    targets: List[Path] = []
-    seen: Set[str] = set()
 
-    def add_target(p: Path) -> None:
-        norm = os.path.abspath(str(p))
-        if norm not in seen:
-            seen.add(norm)
-            targets.append(Path(norm))
-
-    for b in (args.bin or []):
-        add_target(Path(os.path.expanduser(b)))
-
+    raw_targets: List[Path] = [Path(b) for b in (args.bin or [])]
     if unwrap_all or args.agents:
         for name in selected_names:
             profile = AGENT_PROFILES[name]
-            for p in _discover_profile_bins(profile):
-                add_target(p)
-            for p in profile.extra_paths:
-                add_target(p)
-
+            raw_targets.extend(_discover_profile_bins(profile))
+            raw_targets.extend(profile.extra_paths)
     if unwrap_all:
-        for p in _load_wrapped_registry():
-            add_target(Path(p))
+        raw_targets.extend(Path(p) for p in _load_wrapped_registry())
+
+    targets = _dedupe_paths(raw_targets)
 
     restored = 0
     for target in targets:
@@ -1437,7 +1666,9 @@ def cmd_unwrap(args: argparse.Namespace) -> int:
             restored += 1
 
     if restored == 0:
-        print("No wrapped scripts found to restore.")
+        print(note("Nothing to restore: no wrapped scripts found."))
+    else:
+        print(ok(f"Restored {restored} CLI(s) to their original binaries."))
 
     return 0
 
@@ -1447,7 +1678,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        raise ValueError("Missing command to run. Example: agent-proxy run claude")
+        raise ValueError(
+            "Missing command to run. Example: agent-proxy run claude (or: agent-proxy run -- npm test)"
+        )
     _ensure_proxy_running(args.host, args.port)
     env = os.environ.copy()
     env.update(_proxy_env(args.host, args.port))
@@ -1579,6 +1812,14 @@ def _uninstall_from_path(rc_path: Path) -> bool:
     return True
 
 
+def _dir_on_path(directory: Path) -> bool:
+    target = os.path.abspath(str(directory))
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry and os.path.abspath(os.path.expanduser(entry)) == target:
+            return True
+    return False
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     if args.remove:
         return cmd_uninstall(args)
@@ -1588,14 +1829,16 @@ def cmd_install(args: argparse.Namespace) -> int:
     shell, rc_path = _detect_shell_and_rc(args.shell, args.rc)
     status = _install_to_path(bin_dir, rc_path, shell)
     if status == "exists":
-        print(f"PATH already includes {bin_dir} (config: {rc_path}); nothing to add.")
+        print(f"{note('PATH already includes')} {value(str(bin_dir))} {note(f'(config: {rc_path}); nothing to add.')}")
     elif status == "updated":
-        print(f"Updated agent-proxy PATH entry in {rc_path} to: {bin_dir}")
+        print(f"{ok('Updated agent-proxy PATH entry')} in {value(str(rc_path))} to: {value(str(bin_dir))}")
     else:
-        print(f"Added {bin_dir} to PATH (updated: {rc_path})")
-    print("Run the following command to apply in the current terminal (new terminals apply automatically):")
-    print(f"  source {shlex.quote(str(rc_path))}")
-    print("Then you can run `agent-proxy status` from any directory.")
+        print(f"{ok('Added')} {value(str(bin_dir))} {ok('to PATH')} (updated: {value(str(rc_path))})")
+    if _dir_on_path(bin_dir):
+        print(ok("agent-proxy is ready to use."))
+    else:
+        print(note("New terminals pick this up automatically."))
+        print(note("To use it in this terminal now: ") + value(f"source {shlex.quote(str(rc_path))}"))
     return 0
 
 
@@ -1624,10 +1867,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
     if removed_from:
         for rc_path in removed_from:
-            print(f"Removed agent-proxy PATH entry from {rc_path}.")
-        print("Restart your terminal or re-source the shell config file to apply.")
+            print(ok(f"Removed agent-proxy PATH entry from {rc_path}."))
+        print(note("Open a new terminal for the change to take effect there."))
     else:
-        print("No agent-proxy PATH entry found in shell config files.")
+        print(note("Nothing to remove: no agent-proxy PATH entry found in shell config files."))
     return 0
 
 
@@ -1635,9 +1878,17 @@ DEFAULT_REPO_URL = "https://github.com/vFrida/agent-proxy.git"
 DEFAULT_UPDATE_REF = "main"
 
 
-def _run_git(repo_dir: Path, *git_args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _run_git(
+    repo_dir: Path,
+    *git_args: str,
+    check: bool = True,
+    timeout: float = 120.0,
+) -> subprocess.CompletedProcess:
     cmd = ["git", "-C", str(repo_dir), *git_args]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"git {' '.join(git_args)} timed out after {timeout:.0f}s") from exc
     if check and res.returncode != 0:
         detail = (res.stderr or res.stdout).strip() or f"exit code {res.returncode}"
         raise RuntimeError(f"git {' '.join(git_args)} failed: {detail}")
@@ -1664,7 +1915,7 @@ def _get_git_version(repo_dir: Optional[Path] = None) -> Tuple[Optional[int], Op
 def _format_version(repo_dir: Optional[Path] = None, short: bool = False) -> str:
     count, sha, is_shallow = _get_git_version(repo_dir)
     if count is None:
-        return "0" if short else "agent-proxy unknown (not a git repository)"
+        return "0" if short else "agent-proxy (unknown version: not a git checkout)"
     if short:
         return str(count)
     parts = [f"agent-proxy v{count}"]
@@ -1724,22 +1975,24 @@ def cmd_update(args: argparse.Namespace) -> int:
                 "Commit or stash them first, or re-run with `agent-proxy update --force`."
             )
 
-        print(f"Fetching latest changes from {repo_url} ({ref})...")
+        print(f"{note('Fetching latest changes from')} {value(repo_url)} {note(f'({ref})...')}")
         if _path_exists_safe(repo_dir / ".git" / "shallow"):
-            unshallow_res = _run_git(repo_dir, "fetch", "--unshallow", "origin", ref, check=False)
+            unshallow_res = _run_git(
+                repo_dir, "fetch", "--unshallow", "origin", ref, check=False, timeout=300.0
+            )
             if unshallow_res.returncode != 0:
-                _run_git(repo_dir, "fetch", "origin", ref)
+                _run_git(repo_dir, "fetch", "origin", ref, timeout=300.0)
         else:
-            _run_git(repo_dir, "fetch", "origin", ref)
+            _run_git(repo_dir, "fetch", "origin", ref, timeout=300.0)
 
         _run_git(repo_dir, "checkout", "-f", "-B", ref, "FETCH_HEAD")
     else:
         repo_url = explicit_url or DEFAULT_REPO_URL
         ref = explicit_ref or DEFAULT_UPDATE_REF
-        print(f"Initializing git repository in {repo_dir} from {repo_url} ({ref})...")
+        print(f"{note('Initializing git repository in')} {value(str(repo_dir))} {note(f'from {repo_url} ({ref})...')}")
         _run_git(repo_dir, "init", "-q")
         _run_git(repo_dir, "remote", "add", "origin", repo_url)
-        _run_git(repo_dir, "fetch", "origin", ref)
+        _run_git(repo_dir, "fetch", "origin", ref, timeout=300.0)
         _run_git(repo_dir, "checkout", "-f", "-B", ref, "FETCH_HEAD")
 
     for exe_name in ("agent-proxy", "agent_proxy.py"):
@@ -1749,27 +2002,27 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     new_count, new_sha, _ = _get_git_version(repo_dir)
     if old_sha and new_sha and old_sha == new_sha:
-        print(f"Already up to date: {_format_version(repo_dir)}")
+        print(warn(f"Already up to date: {_format_version(repo_dir)}"))
         return 0
 
     if old_count is not None and new_count is not None:
         old_label = f"v{old_count} ({old_sha})" if old_sha else f"v{old_count}"
         new_label = f"v{new_count} ({new_sha})" if new_sha else f"v{new_count}"
-        print(f"Updated agent-proxy: {old_label} -> {new_label}")
+        print(f"{ok('Updated agent-proxy:')} {old_label} -> {value(new_label)}")
     else:
-        print(f"Updated agent-proxy to {_format_version(repo_dir)}")
+        print(f"{ok('Updated agent-proxy to')} {value(_format_version(repo_dir))}")
 
     running_state = read_running_state()
     if running_state:
         if args.restart:
-            host = str(running_state.get("listen_host", DEFAULT_LISTEN_HOST))
-            port = int(running_state.get("listen_port", DEFAULT_LISTEN_PORT))
+            host = str(running_state.get("listen_host") or DEFAULT_LISTEN_HOST)
+            port = _as_int(running_state.get("listen_port"), DEFAULT_LISTEN_PORT)
             stop_daemon()
             uri = resolve_upstream_uri(None)
             new_state = start_daemon(uri, host, port, insecure=False, verbose=False)
-            print(f"Restarted proxy daemon (PID {new_state['pid']}) on {host}:{port}.")
+            print(ok(f"Restarted proxy daemon (PID {new_state['pid']}) on {host}:{port}."))
         else:
-            print("Note: proxy daemon is running; run `agent-proxy stop && agent-proxy start -d` (or `agent-proxy update --restart`) to reload.")
+            print(warn("Note: proxy daemon is running; run `agent-proxy stop && agent-proxy start -d` (or `agent-proxy update --restart`) to reload."))
     return 0
 
 
@@ -1777,6 +2030,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="agent-proxy",
         description="Zero-dependency local proxy & multi-agent CLI wrapper (Antigravity / Claude / Codex / Cursor).",
+        epilog=(
+            "Examples:\n"
+            "  agent-proxy start -d                 Start the background proxy\n"
+            "  agent-proxy wrap                     Route all detected agents through the proxy\n"
+            "  agent-proxy run codex -- --help      Run one command with proxy env vars\n"
+            "  agent-proxy env                      Print shell exports for this terminal\n"
+            "  agent-proxy status                   Show daemon status and endpoints"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("-V", "--version", action="version", version=_format_version())
     sub = p.add_subparsers(dest="command", required=True)
@@ -1805,7 +2067,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.set_defaults(func=cmd_list)
 
     # wrap
-    p_wrap = sub.add_parser("wrap", help="Wrap CLI tools (agy / claude / codex / cursor) to auto-use proxy")
+    p_wrap = sub.add_parser(
+        "wrap",
+        help="Wrap CLI tools (agy / claude / codex / cursor) to auto-use the proxy",
+        description="Replace agent launchers with wrappers that start the local proxy and inject proxy env vars.",
+    )
     p_wrap.add_argument("agents", nargs="*", help="Target agents: agy, claude, codex, cursor, or all (default: all detected)")
     p_wrap.add_argument("--uri", help="Upstream VLESS URI to save before wrapping (prompts interactively if not yet configured)")
     p_wrap.add_argument("--host", default=DEFAULT_LISTEN_HOST, help=f"Proxy host (default: {DEFAULT_LISTEN_HOST})")
@@ -1891,10 +2157,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return int(args.func(args))
     except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(fail(f"Error: {exc}"), file=sys.stderr)
         return 2
     except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(fail(f"Error: {exc}"), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(note("Interrupted."), file=sys.stderr)
+        return 130
+    except OSError as exc:
+        print(fail(f"System error: {exc}"), file=sys.stderr)
         return 1
 
 

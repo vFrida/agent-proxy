@@ -138,6 +138,8 @@ Or switch and save from the command line:
 
 Self-test: `python3 -m unittest test_agent_proxy -v`
 
+Colors: output is colorized automatically on a TTY. Override with `AGENT_PROXY_COLOR=always|never|auto`; `NO_COLOR=1` disables colors as well.
+
 ---
 
 ## FAQ
@@ -150,3 +152,5 @@ Self-test: `python3 -m unittest test_agent_proxy -v`
 | Not effective in the current session after wrapping | Old processes have a fixed env: `./agent-proxy wrap --restart` or restart the IDE / Reload Window |
 | Port already in use | `lsof -nP -iTCP:17890`; or start with `--port <new-port>` and re-run `wrap --port <new-port>` |
 | Full uninstall | `./agent-proxy unwrap` (restores all wrapper scripts) |
+| Wrapped CLI warns "local proxy ... unavailable" | Check `./agent-proxy status` and `~/.agent-proxy/proxy.log`; the CLI still launches without the proxy |
+| Switched to a new node but traffic still uses the old one | `./agent-proxy start -d` restarts the daemon automatically when the upstream node changes |
